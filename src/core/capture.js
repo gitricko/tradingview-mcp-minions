@@ -31,12 +31,24 @@ export function withTimeout(promise, ms, stage) {
   const timeoutMs = ms ?? resolveCaptureTimeoutMs();
   let timer;
   const timeout = new Promise((_, reject) => {
+    // Deliberately NOT unref'd at setup: an unref'd timer doesn't hold Node's
+    // event loop open, so a never-settling promise can let the process exit
+    // before the (short) timeout fires — node:test then reports
+    // "Promise resolution is still pending but the event loop has resolved"
+    // (failureType: cancelledByParent). The timer stays ref'd while pending…
     timer = setTimeout(() => {
       reject(new Error(`capture timed out during ${stage} after ${timeoutMs}ms`));
     }, timeoutMs);
-    if (timer.unref) timer.unref();
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  // …and is released only once the awaited promise settles, so the resolved
+  // path still exits promptly instead of holding the process open. The chain
+  // is driven by Promise.resolve() so settle (resolve or reject) triggers the
+  // unref without creating a second unhandled rejection.
+  Promise.resolve(promise).then(
+    () => timer.unref?.(),
+    () => timer.unref?.(),
+  );
+  return Promise.race([promise, timeout]);
 }
 
 export function isCaptureTimeout(err) {
