@@ -34,6 +34,27 @@ describe('buildOverrides() — shorthand style params', () => {
     assert.deepEqual(buildOverrides({ color: '#FF80AB' }), { linecolor: '#FF80AB' });
   });
 
+  it('maps color -> border + fill keys for fillable shapes (rectangle)', () => {
+    assert.deepEqual(
+      buildOverrides({ shape: 'rectangle', color: '#FF5252' }),
+      { color: '#FF5252', fillBackground: true },
+    );
+  });
+
+  it('still maps color -> linecolor for line shapes (trend_line)', () => {
+    assert.deepEqual(
+      buildOverrides({ shape: 'trend_line', color: '#FF80AB' }),
+      { linecolor: '#FF80AB' },
+    );
+  });
+
+  it('maps fill_color -> backgroundColor for fillable shapes', () => {
+    assert.deepEqual(
+      buildOverrides({ shape: 'ellipse', color: '#00FF00', fill_background: true, fill_color: '#FF5252' }),
+      { color: '#00FF00', fillBackground: true, backgroundColor: '#FF5252' },
+    );
+  });
+
   it('linecolor takes precedence over color', () => {
     assert.deepEqual(
       buildOverrides({ color: '#000000', linecolor: '#FF80AB' }),

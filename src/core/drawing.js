@@ -17,6 +17,13 @@ export const SHAPE_TYPES = {
 
 const VOLUME_PROFILE_SHAPES = new Set(['fixed_range_volume_profile', 'anchored_volume_profile']);
 
+/**
+ * Fillable shapes read their border color from `color` (not `linecolor`) and
+ * their interior from `backgroundColor`. Verified on TradingView Desktop
+ * 3.4.1: creating a rectangle with `{ linecolor }` is silently dropped.
+ */
+export const FILLABLE_SHAPES = new Set(['rectangle', 'ellipse', 'fib_retracement', 'fib_extension', 'parallel_channel', 'long_position', 'short_position', 'date_range', 'price_range']);
+
 function _resolve(deps) {
   return {
     evaluate: deps?.evaluate || _evaluate,
@@ -36,17 +43,28 @@ function _resolve(deps) {
  * screenshot. Explicit `overrides` wins on conflict: it is the lower-level
  * escape hatch.
  */
-export function buildOverrides({ overrides: raw, color, linecolor, linewidth, linestyle, textcolor, fontsize } = {}) {
+export function buildOverrides({ overrides: raw, color, linecolor, linewidth, linestyle, textcolor, fontsize, fill_background, fill_color, shape } = {}) {
   let explicit = {};
   if (raw) {
     explicit = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (typeof explicit !== 'object' || Array.isArray(explicit)) {
+    if (typeof explicit !== 'object' || explicit === null || Array.isArray(explicit)) {
       throw new Error('overrides must be a JSON object');
     }
   }
   const shorthand = {};
   const lc = linecolor !== undefined ? linecolor : color;
-  if (lc !== undefined) shorthand.linecolor = lc;
+  if (FILLABLE_SHAPES.has(shape)) {
+    // Fillable shapes (rectangle, ellipse, fib, positions, ...) read their
+    // border from `color` and their interior from `backgroundColor` — they
+    // ignore `linecolor` entirely.
+    if (lc !== undefined) shorthand.color = lc;
+    if (fill_background === true || (shape === 'rectangle' && lc !== undefined)) {
+      shorthand.fillBackground = true;
+    }
+    if (fill_color !== undefined) shorthand.backgroundColor = fill_color;
+  } else {
+    if (lc !== undefined) shorthand.linecolor = lc;
+  }
   if (linewidth !== undefined) shorthand.linewidth = linewidth;
   if (linestyle !== undefined) shorthand.linestyle = linestyle;
   if (textcolor !== undefined) shorthand.textcolor = textcolor;
@@ -105,9 +123,9 @@ export function priceToTicks(from, to, minTick) {
   return Math.max(1, Math.round(Math.abs(to - from) / mt));
 }
 
-export async function drawShape({ shape, point, point2, points, overrides: overridesRaw, text, color, linecolor, linewidth, linestyle, textcolor, fontsize, _deps }) {
+export async function drawShape({ shape, point, point2, points, overrides: overridesRaw, text, color, linecolor, linewidth, linestyle, textcolor, fontsize, fill_background, fill_color, _deps }) {
   const { evaluate, evaluateAsync, getChartApi } = _resolve(_deps);
-  const overrides = buildOverrides({ overrides: overridesRaw, color, linecolor, linewidth, linestyle, textcolor, fontsize });
+  const overrides = buildOverrides({ shape, overrides: overridesRaw, color, linecolor, linewidth, linestyle, textcolor, fontsize, fill_background, fill_color });
   const apiPath = await getChartApi();
   const overridesStr = JSON.stringify(overrides || {});
   const textStr = text ? JSON.stringify(text) : '""';

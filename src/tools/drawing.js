@@ -3,7 +3,7 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/drawing.js';
 
 export function registerDrawingTools(server) {
-  server.tool('draw_shape', 'Draw a shape/line on the chart. Style it with color/linewidth/linestyle (or a full `overrides` object). The result echoes style_applied — read back from the chart — and lists any style_not_applied keys.', {
+  server.tool('draw_shape', 'Draw a shape/line on the chart. Style it with color/linewidth/linestyle (or a full `overrides` object); fillable shapes (rectangle, ellipse, fib, positions) fill their interior via fill_background/fill_color. The result echoes style_applied — read back from the chart — and lists any style_not_applied keys.', {
     shape: z.string().describe(`Shape type. 1-point: ${core.SHAPE_TYPES.one_point.join(', ')}. 2-point: ${core.SHAPE_TYPES.two_point.join(', ')}. N-point: ${core.SHAPE_TYPES.multi_point.join(', ')}. Other TradingView line-tool names pass through.`),
     point: z.object({ time: z.coerce.number(), price: z.coerce.number() }).optional().describe('{ time: unix_timestamp, price: number } (first point; omit when using points)'),
     point2: z.object({ time: z.coerce.number(), price: z.coerce.number() }).optional().describe('Second point for two-point shapes (trend_line, rectangle, fib, volume profile, position)'),
@@ -15,9 +15,11 @@ export function registerDrawingTools(server) {
     linestyle: z.coerce.number().optional().describe('0 = solid, 1 = dotted, 2 = dashed'),
     textcolor: z.string().optional().describe('Label text color, e.g. "#FFFFFF"'),
     fontsize: z.coerce.number().optional().describe('Label font size, e.g. 14'),
+    fill_background: z.boolean().optional().describe('Fill the interior (rectangle, ellipse, fib, positions). For rectangle, a plain `color` also implies the fill so a single color arg yields a colored box.'),
+    fill_color: z.string().optional().describe('Interior fill color, e.g. "#FF5252" (maps to backgroundColor; use with fill_background)'),
     overrides: z.union([z.string(), z.record(z.string(), z.any())]).optional().describe('Full style override object, or a JSON string of one (e.g. \'{"linecolor": "#ff0000", "linewidth": 2}\'). Wins over the shorthand params above.'),
-  }, async ({ shape, point, point2, points, overrides, text, color, linecolor, linewidth, linestyle, textcolor, fontsize }) => {
-    try { return jsonResult(await core.drawShape({ shape, point, point2, points, overrides, text, color, linecolor, linewidth, linestyle, textcolor, fontsize })); }
+  }, async ({ shape, point, point2, points, overrides, text, color, linecolor, linewidth, linestyle, textcolor, fontsize, fill_background, fill_color }) => {
+    try { return jsonResult(await core.drawShape({ shape, point, point2, points, overrides, text, color, linecolor, linewidth, linestyle, textcolor, fontsize, fill_background, fill_color })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
