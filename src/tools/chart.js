@@ -72,6 +72,22 @@ export function registerChartTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('chart_frame', 'Frame the chart to a specific time window with full candle visibility — the CDP-reachable equivalent of double-clicking the price axis + time axis. Every bar of the window is visible on the time axis, and the price axis covers those bars low-to-high with headroom (nothing clipped at the pane edges). Provide either from+to (unix seconds) or date (+ optional session). Optionally applies a new symbol/timeframe first, preloads history if the window predates the loaded buffer, and can capture a screenshot proof. This is the repair for a price axis that is locked to a stale range — the #1 way charts end up with clipped/hidden candles.', {
+    symbol: z.string().optional().describe('Optional symbol to switch to first (framing depends on the loaded bar grid).'),
+    timeframe: z.string().optional().describe('Optional timeframe to switch to first (e.g., 5, 60, D).'),
+    from: z.number().optional().describe('Window start, unix seconds (required with to).'),
+    to: z.number().optional().describe('Window end, unix seconds (required with from).'),
+    date: z.string().optional().describe('Calendar day (ISO, e.g. 2024-01-15); pairs with session to derive from/to.'),
+    session: z.string().optional().describe('Session hours to frame when using date: us_regular (09:30-16:00) or full_day (00:00-24:00).'),
+    time_zone: z.number().optional().describe('UTC offset in hours to apply to the date/session window (e.g. -5 for US/Eastern).'),
+    screenshot: boolish.optional().describe('Capture a screenshot of the framed view (default false).'),
+    screenshot_region: z.string().optional().describe('Screenshot region: full|chart|strategy_tester (default chart).'),
+    auto_extend_cache: boolish.optional().describe('Preload history if the window predates the loaded buffer (default true).'),
+  }, async (args) => {
+    try { return jsonResult(await core.frameChart(args)); }
+    catch (err) { return jsonResult({ success: false, error: err.message, ...(err.endpoint_unavailable ? { endpoint_unavailable: true } : {}) }, true); }
+  });
+
   server.tool('symbol_info', 'Get detailed metadata about the current symbol (name, exchange, type, description)', {}, async () => {
     try { return jsonResult(await core.symbolInfo()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }

@@ -336,19 +336,39 @@ export async function getTargetInfo() {
 export async function evaluate(expression, opts = {}) {
   if (_testOverrides?.evaluate) return _testOverrides.evaluate(expression, opts);
   const c = await getClient();
-  const result = await c.Runtime.evaluate({
-    expression,
-    returnByValue: true,
-    awaitPromise: opts.awaitPromise ?? false,
-    ...opts,
-  });
-  if (result.exceptionDetails) {
-    const msg = result.exceptionDetails.exception?.description
-      || result.exceptionDetails.text
-      || 'Unknown evaluation error';
-    throw new Error(`JS evaluation error: ${msg}`);
+  // Hard 30s ceiling: a half-dead TradingView (CDP returns HTTP but the page
+  // JS never answers) otherwise hangs a single evaluate forever. Treat the
+  // timeout as "endpoint unavailable", not a retryable error — the caller can
+  // distinguish it via `endpoint_unavailable` and report it as a blocker.
+  const { timeoutMs = 30000, ...cdpOpts } = opts;
+  let timer;
+  try {
+    const result = await Promise.race([
+      c.Runtime.evaluate({
+        expression,
+        returnByValue: true,
+        awaitPromise: cdpOpts.awaitPromise ?? false,
+        ...cdpOpts,
+      }),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => {
+          const e = new Error('CDP evaluate timed out after ' + timeoutMs + 'ms — endpoint unavailable');
+          e.endpoint_unavailable = true;
+          rej(e);
+        }, timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+      }),
+    ]);
+    if (result.exceptionDetails) {
+      const msg = result.exceptionDetails.exception?.description
+        || result.exceptionDetails.text
+        || 'Unknown evaluation error';
+      throw new Error(`JS evaluation error: ${msg}`);
+    }
+    return result.result?.value;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return result.result?.value;
 }
 
 export async function evaluateAsync(expression) {
