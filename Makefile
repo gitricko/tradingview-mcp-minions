@@ -1,14 +1,14 @@
 DOCKER_NAME=code-server
 DOCKER_IMAGE_NAME=code-server
 VOLUME_NAME=code-server-config
-BACKUP_FILE=hermes_config_backup.tar.gz
+BACKUP_FILE=code-server_backup.tar.gz
 BACKUP_DIR=./backup
 
 .PHONY: backup restore clean docker-image-clean docker-vol-clean docker-clean docker-build
 
 
 colima-start:
-	colima start --profile code-server --cpu 6 --memory 8 --disk 100
+	colima start --profile code-server --cpu 6 --memory 6 --disk 100
 
 colima-stop:
 	colima stop --profile code-server
