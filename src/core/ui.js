@@ -247,6 +247,32 @@ export async function layoutList({ _deps } = {}) {
 }
 
 /**
+ * Poll the page until `document.title` contains the expected layout name.
+ * TradingView titles its chart pages "... <layout-name>", so the title is a
+ * stable, locale-independent signal that the switch actually landed (it is
+ * exactly the signal verified live on TV Desktop 3.4.1). Throws from the
+ * evaluate call (e.g. "Execution context was destroyed" right after a
+ * navigation) are treated as "not yet ready" and polled past.
+ *
+ * Returns `{ verified, title }`.
+ */
+async function _verifyLayoutVisible({ expectedName, evaluate, timeoutMs = 10000, pollMs = 250 }) {
+  const target = String(expectedName).toLowerCase();
+  const start = Date.now();
+  let lastTitle = null;
+  while (Date.now() - start < timeoutMs) {
+    let title = null;
+    try { title = await evaluate(`(function() { return document.title || ''; })()`); } catch { title = null; }
+    if (typeof title === 'string' && title) lastTitle = title;
+    if (lastTitle && lastTitle.toLowerCase().includes(target)) {
+      return { verified: true, title: lastTitle };
+    }
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  return { verified: false, title: lastTitle };
+}
+
+/**
  * Switch to a saved layout.
  *
  * If the current chart has unsaved changes (Pine code, indicator settings,
@@ -262,6 +288,24 @@ export async function layoutList({ _deps } = {}) {
  *
  * Previous behavior auto-discarded silently with no opt-in; that destroyed
  * Pine code without consent (high-severity finding from 2026-05-18 review).
+ *
+ * Path + honesty (2026-11-18 bug: TV Desktop 3.4.1's
+ * `loadChartFromServer` promise rejects with HTTP 404 to
+ * `/chart/undefined/json/`, and the old code fired it without awaiting,
+ * reporting `success: true` while the visible chart never changed):
+ *
+ *   1. Primary: `loadChartFromServer(chartId)` — AWAITED with a bounded
+ *      timeout. A rejection/timeout is a failed primary path, never success.
+ *   2. Fallback (verified-working on 3.4.1): `window.location.assign(
+ *      'https://www.tradingview.com/chart/<slug>/')` using the layout
+ *      entry's `url` (slug) field from `getSavedCharts`.
+ *   3. Verification: poll up to ~10s for `document.title` to contain the
+ *      layout name. If it never lands, the call returns `success: false`
+ *      with the expected layout, observed title, and the primary-path
+ *      error — success is never reported for a switch that did not happen.
+ *
+ * The result carries `method` (`'loadChartFromServer'` | `'url_navigation'`)
+ * so callers can see which path performed the switch.
  */
 export async function layoutSwitch({ name, discard_unsaved = false, _deps }) {
   const { evaluate, evaluateAsync } = _resolve(_deps);
@@ -270,22 +314,64 @@ export async function layoutSwitch({ name, discard_unsaved = false, _deps }) {
     new Promise(function(resolve) {
       try {
         var target = ${escaped};
-        if (/^\\d+$/.test(target)) { window.TradingViewApi.loadChartFromServer(target); resolve({success: true, method: 'loadChartFromServer', id: target, source: 'internal_api'}); return; }
+        function errText(e) {
+          try {
+            if (e && e.message) return e.message;
+            if (e && e.statusText) return e.statusText + (e.status ? ' (status ' + e.status + ')' : '');
+            return String(e);
+          } catch (_) { return 'unknown error'; }
+        }
+        // Await the load promise with a bounded timeout; a rejection (e.g.
+        // HTTP 404 to /chart/undefined/json/) is a FAILED primary path.
+        function awaitPrimary(chartId) {
+          return new Promise(function(res) {
+            var p;
+            try { p = window.TradingViewApi.loadChartFromServer(chartId); }
+            catch (e) { res({ ok: false, error: 'loadChartFromServer threw: ' + errText(e) }); return; }
+            var done = false;
+            var to = setTimeout(function() { if (!done) { done = true; res({ ok: false, error: 'loadChartFromServer timed out after 5000ms' }); } }, 5000);
+            if (p && typeof p.then === 'function') {
+              p.then(
+                function() { if (done) return; done = true; clearTimeout(to); res({ ok: true }); },
+                function(e) { if (done) return; done = true; clearTimeout(to); res({ ok: false, error: 'loadChartFromServer rejected: ' + errText(e) }); }
+              );
+            } else { done = true; clearTimeout(to); res({ ok: true }); }
+          });
+        }
+        if (/^\\d+$/.test(target)) {
+          awaitPrimary(target).then(function(primary) {
+            if (primary.ok) { resolve({ kind: 'switched', method: 'loadChartFromServer', id: target, name: null, slug: null, source: 'internal_api' }); }
+            else { resolve({ error: 'Primary layout load failed and no saved-layout slug is available for the URL fallback. ' + primary.error, id: target, source: 'internal_api' }); }
+          });
+          return;
+        }
         window.TradingViewApi.getSavedCharts(function(charts) {
-          if (!charts || !Array.isArray(charts)) { resolve({success: false, error: 'getSavedCharts returned no data', source: 'internal_api'}); return; }
+          if (!charts || !Array.isArray(charts)) { resolve({ error: 'getSavedCharts returned no data', source: 'internal_api' }); return; }
           var match = null;
           for (var i = 0; i < charts.length; i++) { var cname = charts[i].name || charts[i].title || ''; if (cname === target || cname.toLowerCase() === target.toLowerCase()) { match = charts[i]; break; } }
           if (!match) { for (var j = 0; j < charts.length; j++) { var cn = (charts[j].name || charts[j].title || '').toLowerCase(); if (cn.indexOf(target.toLowerCase()) !== -1) { match = charts[j]; break; } } }
-          if (!match) { resolve({success: false, error: 'Layout "' + target + '" not found.', source: 'internal_api'}); return; }
+          if (!match) { resolve({ error: 'Layout "' + target + '" not found.', source: 'internal_api' }); return; }
           var chartId = match.id || match.chartId;
-          window.TradingViewApi.loadChartFromServer(chartId);
-          resolve({success: true, method: 'loadChartFromServer', id: chartId, name: match.name || match.title, source: 'internal_api'});
+          var layoutName = match.name || match.title;
+          var slug = match.url || null;
+          awaitPrimary(chartId).then(function(primary) {
+            if (primary.ok) { resolve({ kind: 'switched', method: 'loadChartFromServer', id: chartId, name: layoutName, slug: slug, source: 'internal_api' }); return; }
+            if (!slug) { resolve({ error: 'loadChartFromServer failed and the saved-layout entry has no "url" slug for the URL fallback. Primary error: ' + primary.error, id: chartId, name: layoutName, source: 'internal_api' }); return; }
+            // Verified-working fallback on TV Desktop 3.4.1: navigate the
+            // page to the saved chart's URL (slug from getSavedCharts).
+            try { window.location.assign('https://www.tradingview.com/chart/' + slug + '/'); }
+            catch (e) { resolve({ error: 'URL navigation to chart slug "' + slug + '" threw: ' + errText(e) + '. Primary error: ' + primary.error, id: chartId, name: layoutName, source: 'internal_api' }); return; }
+            resolve({ kind: 'switched', method: 'url_navigation', id: chartId, name: layoutName, slug: slug, source: 'internal_api', primary_error: primary.error });
+          });
         });
-        setTimeout(function() { resolve({success: false, error: 'getSavedCharts timed out', source: 'internal_api'}); }, 5000);
-      } catch(e) { resolve({success: false, error: e.message, source: 'internal_api'}); }
+        setTimeout(function() { resolve({ error: 'getSavedCharts timed out', source: 'internal_api' }); }, 5000);
+      } catch(e) { resolve({ error: e.message, source: 'internal_api' }); }
     })
   `);
-  if (!result?.success) throw new Error(result?.error || 'Unknown error switching layout');
+  if (!result) throw new Error('layoutSwitch: no result from page');
+  // Layout not found / no data / lookup timeout are input errors (unchanged
+  // legacy contract: throw; CLI/tool wrappers surface them as failures).
+  if (result.error) throw new Error(result.error);
 
   // Wait briefly for TV to surface the unsaved-changes dialog (if any).
   await new Promise(r => setTimeout(r, 500));
@@ -333,12 +419,44 @@ export async function layoutSwitch({ name, discard_unsaved = false, _deps }) {
     await new Promise(r => setTimeout(r, 1000));
   }
 
+  // Verify the switch actually landed before reporting success — the
+  // 2026-11-18 false-success bug reported `switched` while the visible
+  // chart title was still the previous layout. Title is the verified
+  // signal on TV Desktop 3.4.1; skip only when the caller gave a numeric
+  // ID (no layout name to look for).
+  const verifyTimeoutMs = _deps?.verify_timeout_ms || 10000;
+  const verifyPollMs = _deps?.verify_poll_ms || 250;
+  let verified = null;
+  let observedTitle = null;
+  if (result.name) {
+    const v = await _verifyLayoutVisible({ expectedName: result.name, evaluate, timeoutMs: verifyTimeoutMs, pollMs: verifyPollMs });
+    verified = v.verified;
+    observedTitle = v.title;
+    if (!verified) {
+      return {
+        success: false,
+        layout: result.name,
+        layout_id: result.id,
+        source: result.source,
+        method: result.method,
+        verified: false,
+        observed_title: observedTitle,
+        action: 'failed_verification',
+        discarded_unsaved_changes: discardedUnsavedChanges,
+        error: 'Layout switch to "' + result.name + '" did not take effect: expected the page title to contain "' + result.name + '" but observed "' + (observedTitle || '<empty>') + '"' + (result.primary_error ? '. Primary path error: ' + result.primary_error : ''),
+      };
+    }
+  }
+
   return {
     success: true,
     layout: result.name || name,
     layout_id: result.id,
     source: result.source,
     action: 'switched',
+    method: result.method,
+    verified: verified,
+    ...(observedTitle ? { observed_title: observedTitle } : {}),
     discarded_unsaved_changes: discardedUnsavedChanges,
   };
 }
