@@ -11,6 +11,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -258,6 +259,28 @@ class OnceModeTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(m, "_find_pids", orig[0]))
         rc = m.main(argv)
         self.assertEqual(rc, 0)
+
+
+class RelaunchKeywordTests(unittest.TestCase):
+    """Regression: _relaunch must call subprocess.Popen with a *real* keyword.
+
+    The prior bug used `start_newsession=True` (missing underscore). That only
+    raises TypeError when the call is actually executed, which the mock-based
+    tests never do. This test invokes the real function with a trivial safe argv
+    so the keyword is exercised for real.
+    """
+
+    @unittest.skipIf(
+        os.name == "nt" or not os.path.exists("/bin/true"),
+        "target-specific (POSIX) real-kwarg path; /bin/true unavailable here",
+    )
+    def test_relaunch_real_keyword_returns_popen(self):
+        self.assertFalse(m.IS_WINDOWS)
+        p = m._relaunch(["/bin/true"])
+        self.addCleanup(p.wait)
+        self.assertIsInstance(p, subprocess.Popen)
+        # Reap the child so nothing is left behind.
+        self.assertEqual(p.wait(), 0)
 
 
 if __name__ == "__main__":

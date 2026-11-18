@@ -206,7 +206,7 @@ def _relaunch(argv: list) -> subprocess.Popen:
     if IS_WINDOWS:
         creationflags = 0x00000208  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
         return subprocess.Popen(argv, creationflags=creationflags)
-    return subprocess.Popen(argv, start_newsession=True)
+    return subprocess.Popen(argv, start_new_session=True)
 
 
 def _cdp_ready(host: str, port: int, timeout: float) -> bool:
