@@ -122,6 +122,9 @@ scripts\launch_tv_debug.bat
 **Or use the MCP tool** (auto-detects your install):
 > "Use tv_launch to start TradingView in debug mode"
 
+**Or run the host-side watchdog** — polls CDP and auto starts/restarts
+TradingView when it's down: see [docs/tv-watchdog.md](docs/tv-watchdog.md).
+
 ### 3. Add to Claude Code
 
 Easiest — let the CLI write the config for you:
