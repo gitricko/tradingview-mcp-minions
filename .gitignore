@@ -24,3 +24,8 @@ rules.json
 
 # macOS
 .DS_Store
+
+# Python + tv-restart-switch local state (token, launch.json, logs)
+__pycache__/
+*.pyc
+.tv-restart-switch/

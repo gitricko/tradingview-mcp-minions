@@ -474,6 +474,12 @@ Launch scripts and `tv_launch` auto-detect TradingView. If auto-detection fails:
 
 The key flag: `--remote-debugging-port=9222`
 
+## Restart switch
+
+`scripts/tv-restart-switch.py` is a standalone, localhost-only, token-gated
+helper that restarts TradingView Desktop and waits for CDP to come back
+(single action; for workers without OS access). See [docs/tv-restart-switch.md](docs/tv-restart-switch.md).
+
 ## Testing
 
 ```bash
@@ -482,6 +488,8 @@ npm test
 ```
 
 29 tests covering: Pine Script static analysis, server-side compilation, and CLI routing.
+
+Python unit tests for the restart switch: `python3 -m unittest tests.tv_restart_switch`.
 
 ## Architecture
 
