@@ -60,22 +60,33 @@ describe('core/ui.js — smoke', () => {
     assert.equal(r.layouts[0].name, 'Day Trading');
   });
 
+  // Shared evaluate() mock for layoutSwitch: the dialog probe returns the
+  // given dialog state; the verification probe (document.title + header
+  // layout-selector label) returns the given { title, header_label }.
+  const switchEvaluate = (dialog, verifiedState) => async (expression) => {
+    if (expression.includes('layout-verify-probe')) return verifiedState;
+    return dialog;
+  };
+
   it('test_layoutSwitch_smoke_no_dialog', async () => {
     installCdpMocks({
-      evaluateAsync: async () => ({ success: true, method: 'loadChartFromServer', id: 'L1', name: 'Day Trading' }),
-      evaluate: async () => ({ present: false }),   // no unsaved-changes dialog
+      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Day Trading', source: 'internal_api' }),
+      evaluate: switchEvaluate({ present: false }, { title: '', header_label: 'Day Trading' }),
     });
     const r = await ui.layoutSwitch({ name: 'Day Trading' });
     assert.equal(r.success, true);
     assert.equal(r.layout, 'Day Trading');
+    assert.equal(r.layout_id, 'L1');
     assert.equal(r.action, 'switched');
+    assert.equal(r.method, 'loadChartFromServer');
+    assert.equal(r.verified, true);
     assert.equal(r.discarded_unsaved_changes, false);
   });
 
   it('test_layoutSwitch_smoke_blocked_by_unsaved_dialog', async () => {
     installCdpMocks({
-      evaluateAsync: async () => ({ success: true, method: 'loadChartFromServer', id: 'L1', name: 'Day Trading' }),
-      evaluate: async () => ({ present: true, button_text: 'Open anyway' }),
+      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Day Trading', source: 'internal_api' }),
+      evaluate: switchEvaluate({ present: true, button_text: 'Open anyway' }, { title: '', header_label: 'Day Trading' }),
     });
     const r = await ui.layoutSwitch({ name: 'Day Trading' });
     assert.equal(r.success, false);
@@ -86,12 +97,81 @@ describe('core/ui.js — smoke', () => {
 
   it('test_layoutSwitch_smoke_discard_opt_in', async () => {
     installCdpMocks({
-      evaluateAsync: async () => ({ success: true, method: 'loadChartFromServer', id: 'L1', name: 'Day Trading' }),
-      evaluate: async () => ({ present: true, button_text: 'Discard' }),
+      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Day Trading', source: 'internal_api' }),
+      evaluate: switchEvaluate({ present: true, button_text: 'Discard' }, { title: '', header_label: 'Day Trading' }),
     });
     const r = await ui.layoutSwitch({ name: 'Day Trading', discard_unsaved: true });
     assert.equal(r.success, true);
     assert.equal(r.discarded_unsaved_changes, true);
+    assert.equal(r.verified, true);
+  });
+
+  it('test_layoutSwitch_smoke_primary_rejects_url_fallback_verified', async () => {
+    // 2026-11-18 bug scenario: loadChartFromServer rejects (404 to
+    // /chart/undefined/json/); the page navigates via the slug URL and the
+    // title confirms the layout landed.
+    installCdpMocks({
+      evaluateAsync: async () => ({
+        kind: 'switched', method: 'url_navigation', id: '42', name: 'Agent', source: 'internal_api',
+        primary_error: 'loadChartFromServer rejected: HTTP 404 (https://www.tradingview.com/chart/undefined/json/)',
+      }),
+      evaluate: switchEvaluate({ present: false }, { title: 'Live stock, index, futures, Forex and Bitcoin charts on TradingView', header_label: 'Agent' }),
+    });
+    const r = await ui.layoutSwitch({ name: 'Agent' });
+    assert.equal(r.success, true);
+    assert.equal(r.method, 'url_navigation');
+    assert.equal(r.layout, 'Agent');
+    assert.equal(r.layout_id, '42');
+    assert.equal(r.verified, true);
+    assert.equal(r.action, 'switched');
+  });
+
+  it('test_layoutSwitch_smoke_both_paths_fail', async () => {
+    installCdpMocks({
+      evaluateAsync: async () => ({
+        id: '42', name: 'Agent', source: 'internal_api',
+        error: 'loadChartFromServer failed and the saved-layout entry has no "url" slug for the URL fallback. Primary error: loadChartFromServer rejected: HTTP 404 (https://www.tradingview.com/chart/undefined/json/)',
+      }),
+    });
+    // Same failure contract as "Layout not found": throws with the real
+    // reason; CLI/tool wrappers surface it as a failed result.
+    await assert.rejects(ui.layoutSwitch({ name: 'Agent' }), /loadChartFromServer failed.*HTTP 404/);
+  });
+
+  it('test_layoutSwitch_smoke_verification_timeout', async () => {
+    // Switch path completed but no signal confirmed the layout — this is
+    // exactly the false-success the 2026-11-18 bug produced. Mirrors the
+    // live 3.4.1 observation: the title stays the static app title and the
+    // header label still shows the previous layout.
+    installCdpMocks({
+      evaluateAsync: async () => ({
+        kind: 'switched', method: 'url_navigation', id: '42', name: 'Agent', source: 'internal_api',
+        primary_error: 'loadChartFromServer rejected: HTTP 404',
+      }),
+      evaluate: switchEvaluate({ present: false }, { title: 'Live stock, index, futures, Forex and Bitcoin charts on TradingView', header_label: 'DayTradeVP' }),
+    });
+    const r = await ui.layoutSwitch({ name: 'Agent', _deps: { verify_timeout_ms: 400, verify_poll_ms: 100 } });
+    assert.equal(r.success, false);
+    assert.equal(r.verified, false);
+    assert.equal(r.observed_title, 'Live stock, index, futures, Forex and Bitcoin charts on TradingView');
+    assert.equal(r.observed_header_label, 'DayTradeVP');
+    assert.equal(r.method, 'url_navigation');
+    assert.match(r.error, /no header element with exact text "Agent"/);
+    assert.match(r.error, /does not contain it/);
+    assert.match(r.error, /loadChartFromServer rejected/);
+  });
+
+  it('test_layoutSwitch_smoke_title_signal_only', async () => {
+    // Older/browser-style build where the header label is absent but the
+    // page title carries the layout name — the title remains an accepted
+    // additional signal.
+    installCdpMocks({
+      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Scalper', source: 'internal_api' }),
+      evaluate: switchEvaluate({ present: false }, { title: 'TradingView - Scalper', header_label: null }),
+    });
+    const r = await ui.layoutSwitch({ name: 'Scalper' });
+    assert.equal(r.success, true);
+    assert.equal(r.verified, true);
   });
 
   it('test_keyboard_smoke', async () => {
