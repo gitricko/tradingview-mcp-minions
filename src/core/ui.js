@@ -247,29 +247,66 @@ export async function layoutList({ _deps } = {}) {
 }
 
 /**
- * Poll the page until `document.title` contains the expected layout name.
- * TradingView titles its chart pages "... <layout-name>", so the title is a
- * stable, locale-independent signal that the switch actually landed (it is
- * exactly the signal verified live on TV Desktop 3.4.1). Throws from the
- * evaluate call (e.g. "Execution context was destroyed" right after a
- * navigation) are treated as "not yet ready" and polled past.
+ * Poll the page until a visible element confirms the switch landed.
  *
- * Returns `{ verified, title }`.
+ * Signals (checked in one probe, first hit wins — either one is enough):
+ *   1. HEADER LABEL (reliable on TV Desktop 3.4.1, verified live by
+ *      firstmate): a visible element in the header band (top < 60px) whose
+ *      trimmed `innerText` is EXACTLY the layout name — this is the
+ *      top-right layout-selector label, and it updates on every switch.
+ *      `document.title` is NOT usable as the sole signal on 3.4.1: it stays
+ *      the static app title ("Live stock, index, futures, Forex and Bitcoin
+ *      charts on TradingView") after a successful switch.
+ *   2. PAGE TITLE: `document.title` contains the layout name (works on
+ *      browser-style chart pages, kept as an additional signal).
+ *
+ * Throws from the evaluate call (e.g. "Execution context was destroyed"
+ * right after a navigation) are treated as "not yet ready" and polled past.
+ *
+ * Returns `{ verified, via, title, header_label }` — the observed evidence
+ * on either outcome so a failure can report what the page actually showed.
  */
 async function _verifyLayoutVisible({ expectedName, evaluate, timeoutMs = 10000, pollMs = 250 }) {
-  const target = String(expectedName).toLowerCase();
+  const probe = `(
+    function() {
+      var expected = ${JSON.stringify(expectedName)};
+      /*layout-verify-probe*/
+      var title = '';
+      try { title = document.title || ''; } catch (e) {}
+      var headerLabel = null;
+      try {
+        var els = document.querySelectorAll('div,span,button,a');
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i];
+          if (el.offsetParent === null) continue;
+          if ((el.innerText || '').trim() !== expected) continue;
+          var r = el.getBoundingClientRect();
+          if (r.top < 60) { headerLabel = expected; break; }
+        }
+      } catch (e) {}
+      return { title: title, header_label: headerLabel };
+    }
+  )()`;
   const start = Date.now();
-  let lastTitle = null;
+  let last = { title: null, header_label: null };
   while (Date.now() - start < timeoutMs) {
-    let title = null;
-    try { title = await evaluate(`(function() { return document.title || ''; })()`); } catch { title = null; }
-    if (typeof title === 'string' && title) lastTitle = title;
-    if (lastTitle && lastTitle.toLowerCase().includes(target)) {
-      return { verified: true, title: lastTitle };
+    let p = null;
+    try { p = await evaluate(probe); } catch { p = null; }
+    if (p) last = { title: p.title || null, header_label: p.header_label || null };
+    // Exact match required: a header element showing a DIFFERENT layout
+    // (e.g. the previous one still rendered after a failed switch) must not
+    // verify as success — that is exactly the false-success this exists to
+    // prevent. The in-page probe returns the expected name only on an exact
+    // hit; this guard also protects against a stale/loose probe.
+    if (last.header_label && String(last.header_label) === String(expectedName)) {
+      return { verified: true, via: 'header_label', title: last.title, header_label: last.header_label };
+    }
+    if (last.title && last.title.toLowerCase().includes(String(expectedName).toLowerCase())) {
+      return { verified: true, via: 'title', title: last.title, header_label: last.header_label };
     }
     await new Promise(r => setTimeout(r, pollMs));
   }
-  return { verified: false, title: lastTitle };
+  return { verified: false, via: null, title: last.title, header_label: last.header_label };
 }
 
 /**
@@ -299,10 +336,13 @@ async function _verifyLayoutVisible({ expectedName, evaluate, timeoutMs = 10000,
  *   2. Fallback (verified-working on 3.4.1): `window.location.assign(
  *      'https://www.tradingview.com/chart/<slug>/')` using the layout
  *      entry's `url` (slug) field from `getSavedCharts`.
- *   3. Verification: poll up to ~10s for `document.title` to contain the
- *      layout name. If it never lands, the call returns `success: false`
- *      with the expected layout, observed title, and the primary-path
- *      error — success is never reported for a switch that did not happen.
+ *   3. Verification: poll up to ~10s for a visible element in the header
+ *      band whose exact text is the layout name (the top-right layout
+ *      selector label — the reliable signal on 3.4.1), with `document.title`
+ *      containing the name as an additional signal. If neither confirms,
+ *      the call returns `success: false` with the expected layout, the
+ *      observed title/header evidence, and the primary-path error — success
+ *      is never reported for a switch that did not happen.
  *
  * The result carries `method` (`'loadChartFromServer'` | `'url_navigation'`)
  * so callers can see which path performed the switch.
@@ -421,9 +461,12 @@ export async function layoutSwitch({ name, discard_unsaved = false, _deps }) {
 
   // Verify the switch actually landed before reporting success — the
   // 2026-11-18 false-success bug reported `switched` while the visible
-  // chart title was still the previous layout. Title is the verified
-  // signal on TV Desktop 3.4.1; skip only when the caller gave a numeric
-  // ID (no layout name to look for).
+  // chart never changed. On TV Desktop 3.4.1 the reliable signal is the
+  // header layout-selector label (exact-text element, top < 60px);
+  // `document.title` is an additional signal (firstmate live verification
+  // 2026-11-18: title stays the static app title after a real switch).
+  // Verification is skipped only when the caller gave a numeric ID (no
+  // layout name to look for).
   const verifyTimeoutMs = _deps?.verify_timeout_ms || 10000;
   const verifyPollMs = _deps?.verify_poll_ms || 250;
   let verified = null;
@@ -441,9 +484,10 @@ export async function layoutSwitch({ name, discard_unsaved = false, _deps }) {
         method: result.method,
         verified: false,
         observed_title: observedTitle,
+        observed_header_label: v.header_label || null,
         action: 'failed_verification',
         discarded_unsaved_changes: discardedUnsavedChanges,
-        error: 'Layout switch to "' + result.name + '" did not take effect: expected the page title to contain "' + result.name + '" but observed "' + (observedTitle || '<empty>') + '"' + (result.primary_error ? '. Primary path error: ' + result.primary_error : ''),
+        error: 'Layout switch to "' + result.name + '" did not take effect: no header element with exact text "' + result.name + '" (top < 60px) and page title "' + (observedTitle || '<empty>') + '" does not contain it' + (result.primary_error ? '. Primary path error: ' + result.primary_error : ''),
       };
     }
   }
