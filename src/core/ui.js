@@ -229,21 +229,107 @@ export async function fullscreen({ _deps } = {}) {
   return { success: true, action: 'fullscreen_toggled' };
 }
 
+// Bounded-retry budget for the saved-chart lookup. Live measurements on TV
+// Desktop 3.4.1 (2026-11-18): getSavedCharts normally answers in ~180-400ms,
+// but ~2 in 5 calls in a batch never invoke the callback at all, so the
+// former hard 5s ceiling turned a recoverable stall into a failed
+// layout_switch (2 of 5 switches in the PR #13 verification test). Three 5s
+// attempts with a short gap between them covers a stalled lookup up to ~15s
+// total while never hanging the caller.
+// Bounded-retry budget for the saved-chart lookup. Live measurements on TV
+// Desktop 3.4.1 (2026-11-18): getSavedCharts normally answers in
+// ~180-400ms, but ~2 in 5 calls in a batch never invoke the callback at
+// all, so the former hard 5s ceiling turned a recoverable stall into a
+// failed layout_switch (2 of 5 switches in the PR #13 verification test).
+// Three 3s attempts with a short gap between them keep the total cap
+// around 10s while covering a stalled lookup. A per-attempt in-page
+// fallback (the service's own cached chart list, see _SAVED_CHARTS_LOOKUP)
+// usually recovers a stall within the first attempt, so a full-budget
+// exhaustion is rare.
+const SAVED_CHARTS_ATTEMPTS = 3;
+const SAVED_CHARTS_TIMEOUT_MS = 3000;
+const SAVED_CHARTS_RETRY_DELAY_MS = 400;
+
+/**
+ * One attempt at the saved-chart lookup, resolved by the page-side promise.
+ *
+ * Primary source is `TradingViewApi.getSavedCharts(cb)` — a callback API with
+ * no rejection signal, which is why the timeout lives in-page. If the callback
+ * never fires (the flaky case) we do not simply give up: the same entries are
+ * readable from the internal promise-backed backend,
+ * `_loadChartService._saveLoad.backend.getCharts()`, whose response carries
+ * the identical entry shape (id/name/url/symbol/...) — verified live on
+ * TV Desktop 3.4.1 (2026-11-18). The fallback fires ONLY when the callback is
+ * silent, never when it answered (an answered empty list means the account
+ * really has no layouts; the retry loop above handles retrying).
+ */
+const _SAVED_CHARTS_LOOKUP = (timeoutMs = SAVED_CHARTS_TIMEOUT_MS) => `
+  new Promise(function(resolve) {
+    var settled = false;
+    function ok(charts, via) { if (settled) return; settled = true; resolve({ layouts: charts, source: 'internal_api', via: via }); }
+    function fail(err) { if (settled) return; settled = true; resolve({ layouts: null, error: err, source: 'internal_api' }); }
+    try {
+      window.TradingViewApi.getSavedCharts(function(charts) {
+        if (!charts || !Array.isArray(charts)) { fail('getSavedCharts returned no data'); return; }
+        ok(charts, 'getSavedCharts');
+      });
+      setTimeout(function() {
+        if (settled) return;
+        // Callback never fired: fall back to the internal service, which
+        // caches the same list the callback would have delivered.
+        try {
+          var svc = window.TradingViewApi._loadChartService;
+          var st = svc && svc._state ? svc._state.value() : null;
+          if (st && Array.isArray(st.chartList)) { ok(st.chartList, 'load_chart_service_state'); return; }
+          var backend = svc && svc._saveLoad && svc._saveLoad.backend;
+          if (backend && typeof backend.getCharts === 'function') {
+            var p = backend.getCharts();
+            if (p && typeof p.then === 'function') {
+              p.then(function(charts) {
+                if (Array.isArray(charts)) ok(charts, 'backend_getCharts');
+                else fail('getSavedCharts timed out and backend getCharts returned no data');
+              }, function() { fail('getSavedCharts timed out and backend getCharts rejected'); });
+              return;
+            }
+          }
+        } catch (e) {}
+        fail('getSavedCharts timed out');
+      }, ${timeoutMs});
+    } catch(e) { fail(e && e.message ? e.message : String(e)); }
+  })
+`;
+
+/**
+ * Read the saved-layout list with bounded retries.
+ *
+ * Returns `{ layouts, source, via, error }` after up to `attempts` tries; the
+ * first attempt that yields a list wins. A time-out / exception / no-data
+ * result (layouts === null) is retried until the budget is exhausted, and the
+ * last error is returned so callers report a real reason. An empty-but-valid
+ * list IS an answer — an account with no layouts — and is not retried.
+ */
+async function _getSavedCharts({ evaluateAsync, attempts = SAVED_CHARTS_ATTEMPTS, timeoutMs = SAVED_CHARTS_TIMEOUT_MS, retryDelayMs = SAVED_CHARTS_RETRY_DELAY_MS }) {
+  let last = null;
+  for (let i = 0; i < attempts; i++) {
+    last = (await evaluateAsync(_SAVED_CHARTS_LOOKUP(timeoutMs))) || { layouts: null, error: 'saved-chart lookup returned no data', source: 'internal_api' };
+    if (Array.isArray(last.layouts)) return last;
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, retryDelayMs));
+  }
+  return last || { layouts: null, error: 'getSavedCharts timed out', source: 'internal_api' };
+}
+
 export async function layoutList({ _deps } = {}) {
   const { evaluateAsync } = _resolve(_deps);
-  const layouts = await evaluateAsync(`
-    new Promise(function(resolve) {
-      try {
-        window.TradingViewApi.getSavedCharts(function(charts) {
-          if (!charts || !Array.isArray(charts)) { resolve({layouts: [], source: 'internal_api', error: 'getSavedCharts returned no data'}); return; }
-          var result = charts.map(function(c) { return { id: c.id || c.chartId || null, name: c.name || c.title || 'Untitled', symbol: c.symbol || null, resolution: c.resolution || null, modified: c.timestamp || c.modified || null }; });
-          resolve({layouts: result, source: 'internal_api'});
-        });
-        setTimeout(function() { resolve({layouts: [], source: 'internal_api', error: 'getSavedCharts timed out'}); }, 5000);
-      } catch(e) { resolve({layouts: [], source: 'internal_api', error: e.message}); }
-    })
-  `);
-  return { success: true, layout_count: layouts?.layouts?.length || 0, source: layouts?.source, layouts: layouts?.layouts || [], error: layouts?.error };
+  const layouts = await _getSavedCharts({
+    evaluateAsync,
+    attempts: _deps?.saved_charts_attempts,
+    timeoutMs: _deps?.saved_charts_timeout_ms,
+    retryDelayMs: _deps?.saved_charts_retry_delay_ms,
+  });
+  const list = Array.isArray(layouts?.layouts)
+    ? layouts.layouts.map(function(c) { return { id: c.id || c.chartId || null, name: c.name || c.title || 'Untitled', symbol: c.symbol || null, resolution: c.resolution || null, modified: c.timestamp || c.modified || null }; })
+    : [];
+  return { success: true, layout_count: list.length, source: layouts?.source, layouts: list, error: layouts?.error };
 }
 
 /**
@@ -331,86 +417,230 @@ async function _verifyLayoutVisible({ expectedName, evaluate, timeoutMs = 10000,
  * `/chart/undefined/json/`, and the old code fired it without awaiting,
  * reporting `success: true` while the visible chart never changed):
  *
- *   1. Primary: `loadChartFromServer(chartId)` — AWAITED with a bounded
+ *   1. Lookup: the saved-chart list, read through `_getSavedCharts`
+ *      (bounded retry — see SAVED_CHARTS_ATTEMPTS). A stall that exhausts
+ *      the retry budget is NON-fatal for the switch itself: it falls
+ *      through to the picker fallback (step 4) instead of failing here.
+ *   2. Primary: `loadChartFromServer(chartId)` — AWAITED with a bounded
  *      timeout. A rejection/timeout is a failed primary path, never success.
- *   2. Fallback (verified-working on 3.4.1): `window.location.assign(
+ *   3. Fallback (verified-working on 3.4.1): `window.location.assign(
  *      'https://www.tradingview.com/chart/<slug>/')` using the layout
- *      entry's `url` (slug) field from `getSavedCharts`.
- *   3. Verification: poll up to ~10s for a visible element in the header
+ *      entry's `url` (slug) field from the saved-chart list.
+ *   4. Picker fallback (new): if the lookup itself exhausted its budget, the
+ *      switch falls through to TV's own layout picker
+ *      (`_PICKER_FALLBACK`), which finds the layout by name in the service's
+ *      cached list and clicks its row — no saved-list lookup needed.
+ *   5. Verification: poll up to ~10s for a visible element in the header
  *      band whose exact text is the layout name (the top-right layout
  *      selector label — the reliable signal on 3.4.1), with `document.title`
  *      containing the name as an additional signal. If neither confirms,
  *      the call returns `success: false` with the expected layout, the
  *      observed title/header evidence, and the primary-path error — success
- *      is never reported for a switch that did not happen.
+ *      is never reported for a switch that did not happen. Only when the
+ *      picker fallback ALSO fails do we report `success: false` before
+ *      verification.
  *
- * The result carries `method` (`'loadChartFromServer'` | `'url_navigation'`)
- * so callers can see which path performed the switch.
+ * The result carries `method` (`'loadChartFromServer'` | `'url_navigation'` |
+ * `'layout_picker'`) so callers can see which path performed the switch.
  */
+// In-page: switch to the layout matching `target` WITHOUT the saved-list
+// lookup, by opening TV's own layout picker (the "Manage layouts" menu) and
+// clicking the row whose name matches. Returns the slug of the picked chart.
+//
+// This is the fallback when the JS lookups above (`getSavedCharts` /
+// `loadChartFromServer`) fail — e.g. the saved-list call stalls for its whole
+// budget. The picker is rendered from the service's own cached list and its
+// rows are anchors with `/chart/<slug>/` hrefs, verified live on TV Desktop
+// 3.4.1 (2026-11-18).
+const _PICKER_FALLBACK = (target) => `
+  (function() {
+    function fail(err) { return { error: err }; }
+    function findMenuButton() {
+      return document.querySelector('[data-name="save-load-menu"]')
+        || document.querySelector('[aria-label="Manage layouts"]')
+        || document.querySelector('[aria-label*="layouts" i]');
+    }
+    try {
+      var target = ${JSON.stringify(target)};
+      var menu = findMenuButton();
+      if (!menu) return fail('layout picker button not found (data-name=save-load-menu)');
+      menu.click();
+      var norm = function(s) { return String(s || '').trim().toLowerCase(); };
+      var t = norm(target);
+      var before = location.href;
+      // The picker grid renders asynchronously after the click.
+      return new Promise(function(resolve) {
+        var deadline = Date.now() + 4000;
+        (function poll() {
+          var as = document.querySelectorAll('a[href*="/chart/"]');
+          var hit = null;
+          for (var i = 0; i < as.length; i++) {
+            var a = as[i];
+            if (a.offsetParent === null) continue;
+            var host = a.closest('[role="row"]') || a.parentElement || a;
+            var txt = norm((host.innerText || '').split('\\n')[0]);
+            // Compare on the first line only: rows render as
+            // "<layout name>\n<symbol>, <TF>" so a symbol/TF can never
+            // satisfy the requested name.
+            if (txt === t || txt.indexOf(t) !== -1) { hit = a; break; }
+          }
+          if (hit) {
+            try { hit.click(); }
+            catch (e) { resolve(fail('layout row click threw: ' + (e && e.message))); return; }
+            // The row navigates the page; give it a beat to start.
+            setTimeout(function() {
+              resolve({ ok: true, name: target, slug: (hit.getAttribute('href') || '').replace(/^.*\\/chart\\/([^\\/]+)\\/.*$/, '$1'), before_href: before, after_href: location.href });
+            }, 300);
+            return;
+          }
+          if (Date.now() > deadline) { resolve(fail('layout "' + target + '" not found in the layout picker')); return; }
+          setTimeout(poll, 150);
+        })();
+      });
+    } catch (e) { return fail(e && e.message ? e.message : String(e)); }
+  })()
+`;
+
+// In-page: match a target layout name against a saved-chart entry list.
+// Exact match first, then a case-insensitive substring match (legacy
+// contract: a wrong-case or partial name still resolves).
+const _MATCH_ENTRY = `
+  function matchEntry(charts, target) {
+    var want = String(target || '').toLowerCase();
+    var i, name;
+    for (i = 0; i < charts.length; i++) { name = (charts[i].name || charts[i].title || ''); if (name === target || name.toLowerCase() === want) return charts[i]; }
+    for (i = 0; i < charts.length; i++) { name = (charts[i].name || charts[i].title || '').toLowerCase(); if (name.indexOf(want) !== -1) return charts[i]; }
+    return null;
+  }
+`;
+
 export async function layoutSwitch({ name, discard_unsaved = false, _deps }) {
   const { evaluate, evaluateAsync } = _resolve(_deps);
   const escaped = JSON.stringify(name);
-  const result = await evaluateAsync(`
+
+  // In-page: load one layout by ID, falling back to URL-slug navigation when
+  // the entry carries a slug (the verified-working path from PR #13).
+  const _LOAD_BY_ID = (entry) => `
     new Promise(function(resolve) {
-      try {
-        var target = ${escaped};
-        function errText(e) {
-          try {
-            if (e && e.message) return e.message;
-            if (e && e.statusText) return e.statusText + (e.status ? ' (status ' + e.status + ')' : '');
-            return String(e);
-          } catch (_) { return 'unknown error'; }
-        }
-        // Await the load promise with a bounded timeout; a rejection (e.g.
-        // HTTP 404 to /chart/undefined/json/) is a FAILED primary path.
-        function awaitPrimary(chartId) {
-          return new Promise(function(res) {
-            var p;
-            try { p = window.TradingViewApi.loadChartFromServer(chartId); }
-            catch (e) { res({ ok: false, error: 'loadChartFromServer threw: ' + errText(e) }); return; }
-            var done = false;
-            var to = setTimeout(function() { if (!done) { done = true; res({ ok: false, error: 'loadChartFromServer timed out after 5000ms' }); } }, 5000);
-            if (p && typeof p.then === 'function') {
-              p.then(
-                function() { if (done) return; done = true; clearTimeout(to); res({ ok: true }); },
-                function(e) { if (done) return; done = true; clearTimeout(to); res({ ok: false, error: 'loadChartFromServer rejected: ' + errText(e) }); }
-              );
-            } else { done = true; clearTimeout(to); res({ ok: true }); }
-          });
-        }
-        if (/^\\d+$/.test(target)) {
-          awaitPrimary(target).then(function(primary) {
-            if (primary.ok) { resolve({ kind: 'switched', method: 'loadChartFromServer', id: target, name: null, slug: null, source: 'internal_api' }); }
-            else { resolve({ error: 'Primary layout load failed and no saved-layout slug is available for the URL fallback. ' + primary.error, id: target, source: 'internal_api' }); }
-          });
+      var entry = ${JSON.stringify(entry)};
+      function errText(e) {
+        try {
+          if (e && e.message) return e.message;
+          if (e && e.statusText) return e.statusText + (e.status ? ' (status ' + e.status + ')' : '');
+          return String(e);
+        } catch (_) { return 'unknown error'; }
+      }
+      new Promise(function(res) {
+        var p;
+        try { p = window.TradingViewApi.loadChartFromServer(entry.id); }
+        catch (e) { res({ ok: false, error: 'loadChartFromServer threw: ' + errText(e) }); return; }
+        var done = false;
+        var to = setTimeout(function() { if (!done) { done = true; res({ ok: false, error: 'loadChartFromServer timed out after 5000ms' }); } }, 5000);
+        if (p && typeof p.then === 'function') {
+          p.then(
+            function() { if (done) return; done = true; clearTimeout(to); res({ ok: true }); },
+            function(e) { if (done) return; done = true; clearTimeout(to); res({ ok: false, error: 'loadChartFromServer rejected: ' + errText(e) }); }
+          );
+        } else { done = true; clearTimeout(to); res({ ok: true }); }
+      }).then(function(primary) {
+        if (primary.ok || !entry.slug) {
+          resolve({ ok: !!primary.ok, error: primary.error || (primary.ok ? null : 'no saved-layout "url" slug is available for the URL fallback'), id: entry.id, name: entry.name || null, slug: entry.slug || null });
           return;
         }
-        window.TradingViewApi.getSavedCharts(function(charts) {
-          if (!charts || !Array.isArray(charts)) { resolve({ error: 'getSavedCharts returned no data', source: 'internal_api' }); return; }
-          var match = null;
-          for (var i = 0; i < charts.length; i++) { var cname = charts[i].name || charts[i].title || ''; if (cname === target || cname.toLowerCase() === target.toLowerCase()) { match = charts[i]; break; } }
-          if (!match) { for (var j = 0; j < charts.length; j++) { var cn = (charts[j].name || charts[j].title || '').toLowerCase(); if (cn.indexOf(target.toLowerCase()) !== -1) { match = charts[j]; break; } } }
-          if (!match) { resolve({ error: 'Layout "' + target + '" not found.', source: 'internal_api' }); return; }
-          var chartId = match.id || match.chartId;
-          var layoutName = match.name || match.title;
-          var slug = match.url || null;
-          awaitPrimary(chartId).then(function(primary) {
-            if (primary.ok) { resolve({ kind: 'switched', method: 'loadChartFromServer', id: chartId, name: layoutName, slug: slug, source: 'internal_api' }); return; }
-            if (!slug) { resolve({ error: 'loadChartFromServer failed and the saved-layout entry has no "url" slug for the URL fallback. Primary error: ' + primary.error, id: chartId, name: layoutName, source: 'internal_api' }); return; }
-            // Verified-working fallback on TV Desktop 3.4.1: navigate the
-            // page to the saved chart's URL (slug from getSavedCharts).
-            try { window.location.assign('https://www.tradingview.com/chart/' + slug + '/'); }
-            catch (e) { resolve({ error: 'URL navigation to chart slug "' + slug + '" threw: ' + errText(e) + '. Primary error: ' + primary.error, id: chartId, name: layoutName, source: 'internal_api' }); return; }
-            resolve({ kind: 'switched', method: 'url_navigation', id: chartId, name: layoutName, slug: slug, source: 'internal_api', primary_error: primary.error });
-          });
-        });
-        setTimeout(function() { resolve({ error: 'getSavedCharts timed out', source: 'internal_api' }); }, 5000);
-      } catch(e) { resolve({ error: e.message, source: 'internal_api' }); }
+        try {
+          window.location.assign('https://www.tradingview.com/chart/' + entry.slug + '/');
+          resolve({ ok: true, method: 'url_navigation', id: entry.id, name: entry.name || null, slug: entry.slug, primary_error: primary.error });
+        } catch (e) { resolve({ ok: false, error: 'URL navigation to chart slug "' + entry.slug + '" threw: ' + errText(e) + '. Primary error: ' + primary.error, id: entry.id, name: entry.name || null }); }
+      });
     })
-  `);
+  `;
+
+  let result = null;
+
+  // ── Numeric ID: no saved-list lookup needed; load directly by ID ─────
+  if (/^\d+$/.test(String(name))) {
+    const byId = await evaluateAsync(_LOAD_BY_ID({ id: String(name), name: null, slug: null }));
+    if (!byId) throw new Error('layoutSwitch: no result from page');
+    if (byId.ok) {
+      result = { kind: 'switched', method: byId.method || 'loadChartFromServer', id: byId.id, name: null, slug: null, source: 'internal_api' };
+    } else {
+      // Unchanged legacy contract: a failed numeric load throws, with the
+      // note that no slug is available for the URL fallback in this path.
+      throw new Error('Primary layout load failed and no saved-layout slug is available for the URL fallback. ' + byId.error);
+    }
+  } else {
+    // ── Named switch: resolve the saved-list, then load ─────────────────
+    const saved = await _getSavedCharts({
+      evaluateAsync,
+      attempts: _deps?.saved_charts_attempts,
+      timeoutMs: _deps?.saved_charts_timeout_ms,
+      retryDelayMs: _deps?.saved_charts_retry_delay_ms,
+    });
+    if (Array.isArray(saved.layouts)) {
+      const matched = await evaluateAsync(`
+        new Promise(function(resolve) {
+          try {
+            var charts = ${JSON.stringify(saved.layouts)};
+            var target = ${escaped};
+            ${_MATCH_ENTRY}
+            var match = matchEntry(charts, target);
+            resolve(match ? { id: match.id || match.chartId || null, name: match.name || match.title || null, slug: match.url || null } : null);
+          } catch(e) { resolve({ __matchError: e && e.message ? e.message : String(e) }); }
+        })
+      `);
+      if (matched && matched.__matchError) {
+        result = { error: 'saved-layout matching failed: ' + matched.__matchError, source: saved.source };
+      } else if (matched) {
+        const primary = await evaluateAsync(_LOAD_BY_ID(matched));
+        if (primary && primary.ok) {
+          result = {
+            kind: 'switched',
+            method: primary.method || 'loadChartFromServer',
+            id: primary.id,
+            name: primary.name,
+            slug: primary.slug,
+            source: saved.source,
+            primary_error: primary.primary_error,
+          };
+        } else {
+          result = {
+            error: 'loadChartFromServer failed and the saved-layout entry has no "url" slug for the URL fallback. Primary error: ' + (primary?.error || 'unknown'),
+            id: primary?.id ?? matched.id,
+            name: primary?.name ?? matched.name,
+            source: saved.source,
+          };
+        }
+      } else {
+        // List resolved but no entry matches — a genuine "not found".
+        result = { error: 'Layout "' + name + '" not found.', source: saved.source };
+      }
+    } else {
+      result = { error: saved.error || 'saved-layout lookup failed', source: saved.source, lookup_failed: true };
+    }
+  }
+
+  // The saved-list lookup failed (whole retry budget exhausted) — fall
+  // through to the layout picker, which switches by name without needing
+  // the list at all. Success is decided by the verification below, so this
+  // only needs to report failure if the picker also fails.
+  if (result.lookup_failed) {
+    const picked = await evaluateAsync(_PICKER_FALLBACK(name));
+    if (picked && picked.ok) {
+      result = { kind: 'switched', method: 'layout_picker', id: null, name: picked.name || name, slug: picked.slug || null, source: 'internal_api', primary_error: result.error };
+    } else {
+      return {
+        success: false,
+        layout: name,
+        action: 'lookup_and_fallback_failed',
+        error: 'Saved-layout lookup failed (' + result.error + ') and the layout-picker fallback also failed (' + (picked?.error || 'no result') + ').',
+      };
+    }
+  }
+
   if (!result) throw new Error('layoutSwitch: no result from page');
-  // Layout not found / no data / lookup timeout are input errors (unchanged
-  // legacy contract: throw; CLI/tool wrappers surface them as failures).
+  // Layout not found / primary load failed with no URL fallback are input
+  // errors (unchanged legacy contract: throw; CLI/tool wrappers surface
+  // them as failures).
   if (result.error) throw new Error(result.error);
 
   // Wait briefly for TV to surface the unsaved-changes dialog (if any).

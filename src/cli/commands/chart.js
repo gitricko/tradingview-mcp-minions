@@ -64,7 +64,7 @@ register('range', {
 });
 
 register('frame', {
-  description: 'Frame the chart to a time window with full candle visibility (price axis auto-scaled to those bars — the fix for clipped/hidden candles). Provide --from/--to (unix seconds) or --date (+ --session).',
+  description: 'Frame the chart to a time window with full candle visibility (price axis auto-scaled to those bars — the fix for clipped/hidden candles). Provide --from/--to (unix seconds) or --date (+ --session). For --date/--session the window is resolved in the symbol\'s exchange timezone by default; axis labels follow the app\'s display timezone, so labels may look shifted even when the framed bars are exactly right. An explicit --time_zone offset or --from/--to is authoritative.',
   options: {
     from: { type: 'string', description: 'Window start, unix seconds' },
     to: { type: 'string', description: 'Window end, unix seconds' },
@@ -72,7 +72,7 @@ register('frame', {
     session: { type: 'string', description: 'Session: us_regular (09:30-16:00) or full_day' },
     symbol: { type: 'string', description: 'Optional symbol to switch to first' },
     timeframe: { type: 'string', description: 'Optional timeframe to switch to first' },
-    time_zone: { type: 'string', description: 'UTC offset in hours for date/session (e.g. -5)' },
+    time_zone: { type: 'string', description: 'UTC offset in hours for date/session, may be negative (e.g. -5 for US/Eastern); when omitted, the symbol\'s exchange timezone is used. Axis labels follow the app\'s display timezone while the requested window is absolute.' },
     screenshot: { type: 'string', description: '1/true to capture a screenshot proof' },
     region: { type: 'string', description: 'Screenshot region: full|chart|strategy_tester' },
   },

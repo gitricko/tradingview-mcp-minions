@@ -74,8 +74,16 @@ function printCommandHelp(name, cmd) {
  * short flag. Inserts `--` before the first such arg unless the caller
  * already supplied one. Safe because no command defines a `-N` flag —
  * all our short options are `-<letter>`.
+ *
+ * `valueFlags` (optional Set of bare option names, e.g. `time_zone`):
+ * when a leading-hyphen-digit arg is the VALUE of a preceding long option
+ * that takes a string value (`--time_zone -5`), parseArgs (strict:false)
+ * consumes it as that option's value, so it must NOT be shielded. Long
+ * options absent from the set (e.g. boolean flags) never consume a value,
+ * so a `-N` token after them is still a positional and still shielded —
+ * the legacy behavior.
  */
-export function shieldNegativePositionals(args) {
+export function shieldNegativePositionals(args, valueFlags) {
   if (args.includes('--')) return args;
   // Skip when the leading-hyphen-digit arg is the VALUE of a preceding
   // short flag (e.g. `tv replay start -d -7d` — here `-7d` is the date,
@@ -83,14 +91,41 @@ export function shieldNegativePositionals(args) {
   // `-d` and `-7d` decays `-d` into a boolean flag and loses the value.
   // We can't tell from here whether the short flag expects a value, so
   // be conservative: any bare `-<letter>` immediately before defers.
+  // Same idea for long options in `valueFlags`: `--time_zone -5` must
+  // reach the parser intact, otherwise the value is lost to a synthetic
+  // `--` boundary and the option parses empty (the old mis-parse that
+  // surfaced as the confusing "`to` must be greater than `from`" error
+  // on `frame --time_zone -5`).
+  const valueSet = valueFlags ? new Set(valueFlags) : null;
   const idx = args.findIndex((a, i) => {
     if (!/^-\d/.test(a)) return false;
     const prev = args[i - 1];
     if (prev && /^-[a-zA-Z]$/.test(prev)) return false;
+    if (valueSet && prev && /^--[a-zA-Z][\w-]*$/.test(prev) && valueSet.has(prev.slice(2))) return false;
     return true;
   });
   if (idx === -1) return args;
   return [...args.slice(0, idx), '--', ...args.slice(idx)];
+}
+
+/**
+ * The bare names of the string-typed options of a command config — the
+ * long options that consume the next token as their value, i.e. the ones
+ * whose `-N`-looking values must not be shielded. Subcommand options are
+ * included so shielded `run()`/`runOnce()` paths work for nested commands.
+ */
+function valueFlagNames(config) {
+  const names = new Set();
+  const collect = (cfg) => {
+    for (const [k, v] of Object.entries((cfg && cfg.options) || {})) {
+      if (v && v.type !== 'boolean') names.add(k);
+    }
+  };
+  collect(config);
+  if (config && config.subcommands) {
+    for (const sub of config.subcommands.values()) collect(sub);
+  }
+  return names;
 }
 
 /**
@@ -103,7 +138,9 @@ export function shieldNegativePositionals(args) {
  * formatting + writing.
  */
 export async function runOnce(rawArgs) {
-  const args = shieldNegativePositionals(rawArgs);
+  const cmd0 = commands.get(rawArgs[0]);
+  const sub0 = cmd0 && cmd0.subcommands ? cmd0.subcommands.get(rawArgs[1]) : null;
+  const args = shieldNegativePositionals(rawArgs, valueFlagNames(sub0 || cmd0));
   if (args.length === 0) throw new Error('Empty command');
 
   const cmdName = args[0];
@@ -134,7 +171,10 @@ export async function runOnce(rawArgs) {
 }
 
 export async function run(argv) {
-  const args = shieldNegativePositionals(argv.slice(2));
+  const raw = argv.slice(2);
+  const cmd0 = commands.get(raw[0]);
+  const sub0 = cmd0 && cmd0.subcommands ? cmd0.subcommands.get(raw[1]) : null;
+  const args = shieldNegativePositionals(raw, valueFlagNames(sub0 || cmd0));
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     printHelp();
