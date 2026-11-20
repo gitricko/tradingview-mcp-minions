@@ -3,10 +3,35 @@ import { boolish } from './_validation.js';
 import { jsonResult } from './_format.js';
 import * as core from '../core/ui.js';
 import { dismissBlockingDialogs } from '../core/dialog.js';
+import * as healthCore from '../core/health.js';
 
 export function registerUiTools(server) {
   server.tool('ui_dismiss_dialogs', 'Detect and dismiss any blocking modal dialogs (e.g. "Leave current replay?", unsaved-changes prompts). Safe to call when no dialog is open — returns an empty list.', {}, async () => {
     try { return jsonResult({ success: true, dismissed: await dismissBlockingDialogs() }); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('ui_dismiss_popups', 'Dismiss TradingView\'s known marketing overlays that cover the chart: the subscription upsell modal ("Take your subscription to the next level"), the get-realtime-data upgrade prompt, and the new-feature/product tour. Dismisses through the overlay\'s own control ("Don\'t need", "No thanks", …) with a generic close/X fallback, and reports what it cleared vs what is still covering the chart. Safe to call when nothing is up — returns empty lists. Read-only detection: tv_ui_state.', {}, async (_args, _deps) => {
+    try {
+      // `_deps` is dependency-injection for tests only (real MCP callers pass a
+      // single args object); overlayState forwards evaluate/detectPopups/
+      // dismissPopups from it to the page-side probe.
+      const res = await healthCore.overlayState(true, _deps?.detectPopups || _deps?.dismissPopups || _deps?.evaluate ? _deps : undefined);
+      if (res.error) {
+        // Probe itself failed (CDP unreachable / page error) — nothing was
+        // detected, so nothing can be claimed. Surface it as a failure rather
+        // than a false "all clear".
+        return jsonResult({ success: false, error: res.error, dismissed: [], unhandled: [], remaining_overlays: [] }, true);
+      }
+      const unhandled = (res.remaining || []).filter(o => o.unhandled);
+      const stillUp = (res.remaining || []).filter(o => !o.unhandled);
+      return jsonResult({
+        success: res.remaining.length === 0,
+        dismissed: res.dismissed,
+        unhandled,
+        remaining_overlays: stillUp,
+      }, res.remaining.length > 0);
+    }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

@@ -3,6 +3,7 @@
  */
 import { getClient as _getClient, evaluate as _evaluate, getChartCollection as _getChartCollection, withReconnect as _withReconnect } from '../connection.js';
 import { waitForChartRender as _waitForChartRender } from '../wait.js';
+import { overlayState as _overlayState } from './health.js';
 import { execFile as _execFile } from 'node:child_process';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
@@ -25,6 +26,40 @@ export const PREFLIGHT_TIMEOUT_MS = 7000;
 export function resolvePreflightTimeoutMs() {
   const v = Number(process.env.TV_PREFLIGHT_TIMEOUT_MS);
   return Number.isFinite(v) && v > 0 ? v : PREFLIGHT_TIMEOUT_MS;
+}
+
+// Bound for the overlay-dismissal preflight: a couple of CDP round-trips,
+// never a reason to fail a capture. Override with TV_OVERLAY_TIMEOUT_MS.
+export const OVERLAY_TIMEOUT_MS = 5000;
+
+export function resolveOverlayTimeoutMs() {
+  const v = Number(process.env.TV_OVERLAY_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : OVERLAY_TIMEOUT_MS;
+}
+
+/**
+ * Clear a known marketing overlay before the frame is taken, so a capture
+ * documents the chart instead of the subscription-upsell modal.
+ *
+ * Conservative by design: detect first; dismiss only when something matched;
+ * never throws and never retries — a failed dismissal returns the pre-click
+ * evidence (`remaining`) and the caller reports it. `_deps.overlayState` /
+ * `_deps.evaluate` are honored so callers (and tests) can supply their own
+ * probe implementation.
+ *
+ * @returns {Promise<null|{dismissed:Array,remaining:Array,error?:string}>}
+ *   null when nothing needed doing (or detection itself failed).
+ */
+export async function dismissBlockingOverlays({ _deps } = {}) {
+  const deps = _deps?.evaluate || _deps?.overlayState ? _deps : undefined;
+  let state;
+  try {
+    state = await withTimeout(_overlayState(true, deps), resolveOverlayTimeoutMs(), 'overlay dismissal');
+  } catch (err) {
+    return { dismissed: [], remaining: [], error: err.message };
+  }
+  if (!state || ((!state.dismissed?.length && !state.remaining?.length) && !state.error)) return null;
+  return { dismissed: state.dismissed || [], remaining: state.remaining || [], ...(state.error ? { error: state.error } : {}) };
 }
 
 export function withTimeout(promise, ms, stage) {
@@ -94,8 +129,21 @@ function _resolve(deps) {
   };
 }
 
-export async function captureScreenshot({ region, filename, method, output_dir, wait_for_render, _deps } = {}) {
+export async function captureScreenshot({ region, filename, method, output_dir, wait_for_render, dismiss_overlays = true, _deps } = {}) {
   const { evaluate, getChartCollection, withReconnect, waitForChartRender, execFile, platform } = _resolve(_deps);
+
+  // ── Overlay preflight (conservative) ─────────────────────────────────
+  // TV's subscription-upsell / get-realtime / new-feature-tour overlays
+  // cover the chart and would otherwise be what the capture documents.
+  // Detect → dismiss through the overlay's own control → proceed. A
+  // dismissal that fails leaves the overlay reported (`remaining`) rather
+  // than silently capturing a blocked frame.
+  let overlayResult = null;
+  if (dismiss_overlays) {
+    try { overlayResult = await dismissBlockingOverlays({ _deps }); }
+    catch { overlayResult = null; }
+  }
+  const overlayField = overlayResult ? { overlays_dismissed: overlayResult.dismissed, overlays_remaining: overlayResult.remaining } : {};
 
   // Opt-in stabilizer for callers that just changed symbol/timeframe and
   // would otherwise capture the previous frame. Default off because most
@@ -114,6 +162,8 @@ export async function captureScreenshot({ region, filename, method, output_dir, 
       return {
         success: true, method: 'api',
         waited_for_render: !!wait_for_render,
+        ...overlayField,
+        ...(overlayResult?.error ? { overlay_error: overlayResult.error } : {}),
         ...(renderTimedOut && { render_stabilized: false, render_note: 'wait_for_render timed out before the chart stabilized; the frame may be mid-repaint' }),
         note: 'takeScreenshot() triggered — TradingView will save/show the screenshot via its own UI',
       };
@@ -191,6 +241,8 @@ export async function captureScreenshot({ region, filename, method, output_dir, 
   return {
     success: true, method: 'cdp', file_path: filePath, region,
     waited_for_render: !!wait_for_render,
+    ...overlayField,
+    ...(overlayResult?.error ? { overlay_error: overlayResult.error } : {}),
     ...(renderTimedOut && { render_stabilized: false, render_note: 'wait_for_render timed out before the chart stabilized; the frame may be mid-repaint' }),
     size_bytes: Buffer.from(data, 'base64').length,
   };

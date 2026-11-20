@@ -11,6 +11,275 @@ function _resolve(deps) {
   };
 }
 
+// ── Known overlay set (popup / upsell / popover) ──────────────────────────
+// TV pops subscription-upsell and marketing overlays over the chart with no
+// way out via the chart APIs: a screenshot of a "Take your subscription to
+// the next level" modal documents the modal, not the chart. Unlike the
+// dialogs handled in core/dialog.js these are marketing surfaces, not
+// "did you mean?" confirmations — they carry no user data and their own
+// dismiss control is the intended exit, so they are safe to auto-dismiss.
+//
+// Each entry:
+//   id      — stable key surfaced in results / ui-state
+//   match   — regex tested against the overlay container's text
+//   click   — regex tested against the overlay's own dismiss control
+//             ("Don't need", "No thanks", …); tried FIRST
+//   fallback— regex tried against a generic close/X control SECOND
+//   title   — short human label
+const KNOWN_OVERLAYS = [
+  {
+    id: 'subscription_upsell',
+    match: /take your subscription to the next level/i,
+    click: /^don'?t need$|^no,? thanks$|^no thanks$|^not now$|^maybe later$|^skip$|^don'?t upgrade$/i,
+    fallback: /^close$|^dismiss$|^x$|^cancel$/i,
+    title: 'Subscription upsell modal',
+  },
+  {
+    id: 'get_realtime_prompt',
+    match: /get real-?time data|upgrade to get real-?time|unlock real-?time data|real-?time data is delayed/i,
+    click: /^don'?t need$|^no,? thanks$|^no thanks$|^not now$|^maybe later$|^skip$|^don'?t upgrade$|^continue with delayed data$|^later$/i,
+    fallback: /^close$|^dismiss$|^x$|^cancel$/i,
+    title: 'Get-realtime-data upgrade prompt',
+  },
+  {
+    id: 'new_feature_tour',
+    match: /what'?s new|new features? (in|on) tradingview|take a tour|product tour|new feature tour/i,
+    click: /^skip$|^skip tour$|^don'?t need$|^no,? thanks$|^no thanks$|^not now$|^maybe later$|^close tour$/i,
+    fallback: /^close$|^dismiss$|^x$|^cancel$|^got it$/i,
+    title: 'New-feature / product tour',
+  },
+];
+
+const KNOWN_OVERLAYS_JSON = JSON.stringify(
+  KNOWN_OVERLAYS.map(o => ({
+    id: o.id,
+    match: o.match.source,
+    click: o.click.source,
+    fallback: o.fallback.source,
+    title: o.title,
+  }))
+);
+
+// Injected once per page-side probe (both detection and dismissal use it).
+// The page-side closure returns JSON-serializable records only.
+const OVERLAY_PROBE_HELPERS = `
+    function textOf(el) {
+      var t = '';
+      try { t = (el.innerText || el.textContent || '').trim(); } catch (e) { t = ''; }
+      return t;
+    }
+    function isVisible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      var r = el.getBoundingClientRect();
+      return (r.width > 0 && r.height > 0) && (el.offsetParent !== null || el.getClientRects().length > 0);
+    }
+    function labelOf(btn) {
+      var t = (textOf(btn) || btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.getAttribute('data-name') || '').trim();
+      return t;
+    }
+    function overlayContainers() {
+      var sel = '[role="dialog"], [role="alertdialog"], [role="tooltip"], [aria-modal="true"], ' +
+        '[class*="dialog"], [class*="Dialog"], ' +
+        '[class*="popup"], [class*="Popup"], ' +
+        '[class*="modal"], [class*="Modal"], ' +
+        '[class*="overlay"], [class*="Overlay"], ' +
+        '[class*="popover"], [class*="Popover"], ' +
+        '[data-name*="dialog"], [data-name*="popup"], [data-name*="overlay"]';
+      var seen = new Set();
+      var out = [];
+      var nodes = document.querySelectorAll(sel);
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (seen.has(n)) continue;
+        seen.add(n);
+        out.push(n);
+      }
+      return out;
+    }
+    function matchOverlay(el, overlays) {
+      var txt = textOf(el);
+      if (!txt || txt.length > 600) return null;
+      for (var i = 0; i < overlays.length; i++) {
+        if (new RegExp(overlays[i].match, 'i').test(txt)) return overlays[i];
+      }
+      return null;
+    }
+`;
+
+/**
+ * Detect TradingView's known marketing overlays WITHOUT clicking anything.
+ *
+ * Read-only counterpart of dismissPopups(): a frame that comes back blocked
+ * can be traced to the overlay still covering the chart without mutating
+ * state. Returns an array of { id, title, text, buttons } for every visible
+ * matching overlay, sorted smallest-container-first (the innermost dialog,
+ * not the full-screen backdrop parent).
+ *
+ * @param {object} [opts]
+ * @param {Function} [opts.evaluate] - injected evaluate (test override)
+ * @returns {Promise<Array<{id:string,title:string,text:string,buttons:string[]}>>}
+ */
+export async function detectPopups({ evaluate: evaluateFn } = {}) {
+  const { evaluate } = _resolve({ evaluate: evaluateFn });
+  const found = await evaluate(`
+    (function() {
+      var overlays = ${KNOWN_OVERLAYS_JSON};
+      ${OVERLAY_PROBE_HELPERS}
+      var hits = [];
+      var containers = overlayContainers();
+      for (var i = 0; i < containers.length; i++) {
+        var el = containers[i];
+        if (!isVisible(el)) continue;
+        var pat = matchOverlay(el, overlays);
+        if (!pat) continue;
+        var btns = [];
+        var controls = el.querySelectorAll('button, a, [role="button"], [role="link"]');
+        for (var b = 0; b < controls.length && b < 10; b++) {
+          var lab = labelOf(controls[b]);
+          if (lab && lab.length < 60) btns.push(lab);
+        }
+        hits.push({ id: pat.id, title: pat.title, text: textOf(el).substring(0, 160), buttons: btns });
+      }
+      // Innermost first: a nested dialog matches its backdrop parent too; the
+      // smaller container carries the actionable dismiss control.
+      hits.sort(function(a, b) { return a.text.length - b.text.length; });
+      // Dedup by overlay id — one entry per known overlay type.
+      var seen = {};
+      return hits.filter(function(h) {
+        if (seen[h.id]) return false;
+        seen[h.id] = true;
+        return true;
+      });
+    })()
+  `);
+  return found || [];
+}
+
+/**
+ * Dismiss TradingView's known subscription-upsell / get-realtime /
+ * new-feature-tour overlays through their OWN dismiss control ("Don't need",
+ * "No thanks", …), falling back to a generic close/X control.
+ *
+ * Safe to call when no overlay is present — returns [] and clicks nothing.
+ * Marketing overlays only: no unsaved work or user data sits behind them, so
+ * unlike core/dialog.js there is no destructive-discard gate here.
+ *
+ * @param {object} [opts]
+ * @param {Function} [opts.evaluate] - injected evaluate (test override)
+ * @returns {Promise<{dismissed:Array, remaining:Array}>}
+ *   dismissed: [{ id, title, control, control_text, via: 'own_control'|'close_fallback' }]
+ *   remaining: [{ id, title, text, buttons }] overlays still visible — the
+ *     concrete evidence when a click did not clear the overlay.
+ */
+export async function dismissPopups({ evaluate: evaluateFn } = {}) {
+  const { evaluate } = _resolve({ evaluate: evaluateFn });
+  const result = await evaluate(`
+    (function() {
+      var overlays = ${KNOWN_OVERLAYS_JSON};
+      ${OVERLAY_PROBE_HELPERS}
+      var dismissed = [];
+      var containers = overlayContainers();
+      for (var i = 0; i < containers.length; i++) {
+        var el = containers[i];
+        if (!isVisible(el)) continue;
+        var pat = matchOverlay(el, overlays);
+        if (!pat) continue;
+        // One attempt per overlay id per pass — clicking twice can reopen
+        // or re-arm the surface on some TV builds.
+        var already = false;
+        for (var d = 0; d < dismissed.length; d++) { if (dismissed[d].id === pat.id) { already = true; break; } }
+        if (already) continue;
+
+        // Own-control pass: only text labels (aria-label/title/data-name resolve
+        // them too, so an icon button with a dismiss WORD still counts).
+        function findLabeledControl(rx) {
+          var controls = el.querySelectorAll('button, a, [role="button"], [role="link"]');
+          for (var c = 0; c < controls.length; c++) {
+            if (!isVisible(controls[c])) continue;
+            if (rx.test(labelOf(controls[c]))) return controls[c];
+          }
+          return null;
+        }
+
+        // Generic close pass: conventional close/X affordances, including
+        // icon-only close buttons that expose no text label — reached for
+        // those through their accessible attributes / close-ish class, then
+        // lifted to the enclosing clickable control.
+        function findCloseControl(rx) {
+          var labeled = findLabeledControl(rx);
+          if (labeled) return labeled;
+          var iconSel = '[aria-label*="close" i], [aria-label*="dismiss" i], [data-name*="close" i], [data-name*="dismiss" i], [class*="close" i] svg, [class*="close" i] button, button[class*="close" i], a[class*="close" i], [role="button"][class*="close" i]';
+          var icons = el.querySelectorAll(iconSel);
+          for (var q = 0; q < icons.length; q++) {
+            if (!isVisible(icons[q])) continue;
+            var btn = icons[q].closest ? icons[q].closest('button, a, [role="button"]') : null;
+            return btn && isVisible(btn) ? btn : icons[q];
+          }
+          return null;
+        }
+
+        // Own dismiss control FIRST ("Don't need", "No thanks", …); generic
+        // close/X SECOND. Recorded separately so the result says which one
+        // performed the dismissal.
+        var control = findLabeledControl(new RegExp(pat.click, 'i'));
+        var via = 'own_control';
+        if (!control) {
+          control = findCloseControl(new RegExp(pat.fallback, 'i'));
+          via = 'close_fallback';
+        }
+        if (!control) {
+          dismissed.push({ id: pat.id, title: pat.title, via: 'none', control: null, control_text: null });
+          continue;
+        }
+        var before = textOf(el).substring(0, 40);
+        try { control.click(); } catch (e) {
+          dismissed.push({ id: pat.id, title: pat.title, via: 'error', control: null, control_text: null, error: String(e && e.message || e) });
+          continue;
+        }
+        dismissed.push({
+          id: pat.id, title: pat.title, via: via,
+          control: control.tagName ? control.tagName.toLowerCase() : null,
+          control_text: labelOf(control).substring(0, 40) || null,
+          text_before_click: before,
+        });
+      }
+      return dismissed;
+    })()
+  `);
+  const attempted = result || [];
+  // Failed attempts (no control matched, or the click threw) are kept with
+  // their pre-click evidence — the caller gets the concrete overlay instead
+  // of a guess. Successful attempts are re-checked below.
+  const failed = attempted.filter(d => d.via === 'none' || d.via === 'error');
+  const attemptedIds = new Set(attempted.map(d => d.id));
+  const dismissed = attempted.map(d => ({
+    id: d.id, title: d.title, via: d.via,
+    ...(d.control ? { control: d.control } : {}),
+    ...(d.control_text ? { control_text: d.control_text } : {}),
+    ...(d.text_before_click ? { text: d.text_before_click } : {}),
+    ...(d.error ? { error: d.error } : {}),
+  }));
+  // Post-click re-detection: what is actually still on screen now. An overlay
+  // we clicked that remains visible is reported, not papered over.
+  const stillThere = (await detectPopups({ evaluate })) || [];
+  const surviving = stillThere.filter(o => attemptedIds.has(o.id));
+  // A dismissal is only confirmed when we actually clicked a control AND the
+  // overlay is no longer detected.
+  const confirmed = dismissed.filter(d =>
+    (d.via === 'own_control' || d.via === 'close_fallback') &&
+    !surviving.some(o => o.id === d.id));
+  // `remaining` = overlays still on screen after the attempt. A surviving
+  // overlay that also had a failed attempt (no matching control, or the
+  // click threw) is annotated `unhandled` so the caller gets the concrete
+  // reason rather than a bare "still here".
+  const failedById = new Map(failed.map(d => [d.id, d.via]));
+  const remaining = surviving.map(o => ({
+    ...o,
+    ...(failedById.has(o.id) ? { unhandled: failedById.get(o.id) } : {}),
+  }));
+  return { dismissed: confirmed, remaining };
+}
+
 export async function click({ by, value, _deps }) {
   const { evaluate } = _resolve(_deps);
   const escaped = JSON.stringify(value);

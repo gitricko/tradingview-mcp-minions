@@ -34,6 +34,32 @@ function run(args, opts = {}) {
   }
 }
 
+describe('CLI — overlay dismissal', () => {
+  // Point at a dead CDP endpoint so the probe fails fast and deterministically
+  // (no live TradingView, no retry-against-a-real-server latency).
+  const DEAD = { env: { ...process.env, TV_CDP_HOST: '127.0.0.1', TV_CDP_PORT: '9999' } };
+
+  it('lists `ui dismiss` in the ui help', () => {
+    const { stdout, exitCode } = run(['ui', '--help'], DEAD);
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /dismiss/i);
+  });
+
+  it('exits 2 (connection failure) when CDP is unreachable', () => {
+    const { stdout, stderr, exitCode } = run(['ui', 'dismiss'], { ...DEAD, timeout: 30000 });
+    assert.equal(exitCode, 2, 'unreachable CDP must be exit 2, not a silent success');
+    // Router writes the failure envelope to stderr (stdout stays for results).
+    const body = JSON.parse(stderr);
+    assert.equal(body.success, false);
+    assert.match(body.error, /CDP connection failed/);
+    assert.ok(!('dismissed' in body), 'the failure envelope is minimal — no false dismissal claims');
+    assert.equal(stdout, '');
+  });
+
+  // The clean/dismissal result shape is covered in tests/popup_dismiss.test.js
+  // (both the tool and overlayState levels, via _deps injection).
+});
+
 describe('CLI — help and routing', () => {
   it('--help shows command list', () => {
     const { stdout, exitCode } = run(['--help']);

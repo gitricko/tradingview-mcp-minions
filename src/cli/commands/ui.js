@@ -1,9 +1,38 @@
 import { register } from '../router.js';
 import * as core from '../../core/ui.js';
+import * as healthCore from '../../core/health.js';
+import { dismissBlockingDialogs as _dismissDialogs } from '../../core/dialog.js';
 
 register('ui', {
-  description: 'UI automation tools (click, keyboard, hover, scroll, find, eval, type, panel, fullscreen, mouse)',
+  description: 'UI automation tools (click, keyboard, hover, scroll, find, eval, type, panel, fullscreen, mouse, dismiss)',
   subcommands: new Map([
+    ['dismiss', {
+      description: 'Dismiss known TV overlays (subscription upsell, get-realtime prompt, new-feature tour)',
+      handler: async () => {
+        const res = await healthCore.overlayState(true);
+        if (res.error) {
+          // Probe itself failed (e.g. CDP unreachable) — throw so the router
+          // applies the standard exit-code contract (2 = CDP/connection,
+          // 1 = other), exactly like every other `tv ui` subcommand.
+          throw new Error(res.error);
+        }
+        const unhandled = (res.remaining || []).filter(o => o.unhandled);
+        const stillUp = (res.remaining || []).filter(o => !o.unhandled);
+        const out = {
+          success: res.remaining.length === 0,
+          dismissed: res.dismissed,
+          unhandled,
+          remaining_overlays: stillUp,
+        };
+        if (res.remaining.length > 0) out.error = 'Overlay(s) still covering the chart: ' + res.remaining.map(o => o.id).join(', ');
+        return out;
+      },
+    }],
+    ['dialogs', {
+      description: 'Detect and dismiss blocking modal dialogs (leave-replay, unsaved-changes, save-script)',
+      handler: async () => ({ success: true, dismissed: await _dismissDialogs() }),
+    }],
+
     ['click', {
       description: 'Click a UI element',
       options: {

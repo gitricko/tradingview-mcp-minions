@@ -23,6 +23,9 @@ function makeHarness(scripted) {
     },
     waitForChartReady: async () => true,
     captureScreenshot: async (args) => ({ success: true, method: 'mock', ...args }),
+    // Overlay preflight must stay out of the CDP path in these unit tests —
+    // return null (nothing dismissed, nothing remaining) to skip reporting.
+    dismissBlockingOverlays: async () => null,
   };
 }
 
@@ -159,6 +162,7 @@ describe('core/chart.js — frameChart()', () => {
       },
       waitForChartReady: async () => { order.push('waitForChartReady'); return true; },
       captureScreenshot: async () => ({}),
+      dismissBlockingOverlays: async () => null,
     };
     // Use real setSymbol/setTimeframe? They need more deps. Instead assert that
     // providing symbol without proper _deps throws or attempts — the important

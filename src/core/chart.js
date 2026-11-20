@@ -5,7 +5,7 @@ import { evaluate as _evaluate, evaluateAsync as _evaluateAsync, safeString, req
 import { waitForChartReady as _waitForChartReady, waitForStudiesReady as _waitForStudiesReady } from '../wait.js';
 import { dismissBlockingDialogs as _dismissBlockingDialogs } from './dialog.js';
 import { openScript as _openScript, smartCompile as _smartCompile } from './pine.js';
-import { captureScreenshot as _captureScreenshot } from './capture.js';
+import { captureScreenshot as _captureScreenshot, dismissBlockingOverlays as _dismissBlockingOverlays } from './capture.js';
 
 const CHART_API = 'window.TradingViewApi._activeChartWidgetWV.value()';
 
@@ -19,6 +19,7 @@ function _resolve(deps) {
     getClient: deps?.getClient || _getClient,
     disconnect: deps?.disconnect || _disconnect,
     captureScreenshot: deps?.captureScreenshot || _captureScreenshot,
+    dismissBlockingOverlays: deps?.dismissBlockingOverlays || _dismissBlockingOverlays,
   };
 }
 
@@ -941,7 +942,17 @@ export async function frameChart({
   auto_extend_cache = true,
   _deps,
 }) {
-  const { evaluate, waitForChartReady, captureScreenshot } = _resolve(_deps);
+  const { evaluate, waitForChartReady, captureScreenshot, dismissBlockingOverlays } = _resolve(_deps);
+
+  // ── Overlay preflight ─────────────────────────────────────────────────
+  // A subscription-upsell / get-realtime / new-feature-tour overlay hides the
+  // pane being framed, so the zoom and the postcondition read-back describe
+  // a chart the caller can't see. Dismiss it through its own control once
+  // here, then frame and (optionally) screenshot on the cleared chart — the
+  // nested screenshot gets dismiss_overlays:false so it doesn't re-probe.
+  let overlayResult = null;
+  try { overlayResult = await dismissBlockingOverlays({ _deps }); }
+  catch { overlayResult = null; }
 
   // ── Resolve the target window ─────────────────────────────────────────
   let f = null;
@@ -1095,6 +1106,9 @@ export async function frameChart({
     ...(tz_source ? { tz_source, ...(tz_name ? { tz_name } : {}) } : {}),
     ...(symbol ? { symbol_applied: symbolApplied?.symbol ?? symbolApplied ?? symbol } : {}),
     ...(timeframe ? { timeframe_applied: timeframeApplied?.timeframe ?? timeframeApplied ?? timeframe } : {}),
+    // What the overlay preflight did (null fields when nothing was up).
+    ...(overlayResult ? { overlays_dismissed: overlayResult.dismissed, overlays_remaining: overlayResult.remaining } : {}),
+    ...(overlayResult?.error ? { overlay_error: overlayResult.error } : {}),
   };
 
   // ── Optional screenshot proof ─────────────────────────────────────────
@@ -1103,6 +1117,9 @@ export async function frameChart({
       const shot = await captureScreenshot({
         region: screenshot_region || 'chart',
         output_dir: screenshot_output_dir,
+        // The overlay preflight already ran above; don't spend a second
+        // detection round-trip on the nested screenshot.
+        dismiss_overlays: false,
         _deps,
       });
       out.screenshot = shot;
