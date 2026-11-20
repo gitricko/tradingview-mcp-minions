@@ -126,6 +126,47 @@ describe('CLI — help and routing', () => {
       `Expected indicator name to pass through; got: ${stderr.slice(0, 200)}`,
     );
   });
+
+  // Regression: `frame --date D --session us_regular --time_zone -5` used to
+  // fail with the confusing "`to` must be greater than `from`" because the
+  // router's negative-positional shield turned the flag value into `--` (so
+  // time_zone parsed as the string '--' → NaN). Known string-typed long
+  // options are no longer shielded, so the value flows through as a number.
+  // We can't run a real frame (no TV), but the errors we may legitimately
+  // see are CDP/evaluation ones — never the NaN range error.
+  it('frame --time_zone -5 space form parses (no NaN range error)', () => {
+    const { stderr, exitCode } = run([
+      'frame', '--date', '2026-11-18', '--session', 'us_regular', '--time_zone', '-5',
+    ]);
+    assert.notEqual(exitCode, 0);
+    assert.ok(
+      !/must be greater than/.test(stderr),
+      `time_zone value was lost (NaN). stderr: ${stderr.slice(0, 300)}`,
+    );
+  });
+
+  // The = form must keep working (it was never broken — this pins it).
+  it('frame --time_zone=-5 equals form still parses', () => {
+    const { stderr, exitCode } = run([
+      'frame', '--date', '2026-11-18', '--session', 'us_regular', '--time_zone=-5',
+    ]);
+    assert.notEqual(exitCode, 0);
+    assert.ok(
+      !/must be greater than/.test(stderr),
+      `time_zone value was lost (NaN). stderr: ${stderr.slice(0, 300)}`,
+    );
+  });
+
+  // The shield must still protect genuine leading-hyphen positionals.
+  it('frame --date with a leading-hyphen indicator name still shields', () => {
+    const { stderr, exitCode } = run(['frame', '-4 CB Model']);
+    assert.notEqual(exitCode, 0);
+    // It should not be a parser crash from a dangling option value.
+    assert.ok(
+      !/Unknown option.*-4/.test(stderr),
+      `positional -4 was not shielded. stderr: ${stderr.slice(0, 300)}`,
+    );
+  });
 });
 
 describe('CLI — pine analyze (offline)', () => {

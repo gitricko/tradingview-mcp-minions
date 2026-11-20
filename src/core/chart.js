@@ -872,6 +872,69 @@ async function _resetPriceScaleToVisible(evaluate) {
  * setTimeframe), because framing depends on the bar grid actually loaded.
  * Optionally captures a screenshot of the framed view.
  */
+/**
+ * Read the exchange timezone (IANA name) of the currently loaded symbol.
+ *
+ * The main series' symbol-info property bag carries the exchange's IANA
+ * timezone (e.g. "America/New_York" for US-listed equities) - verified live
+ * on TV Desktop 3.4.1 (2026-11-18): mainSeries()._symbolInfo.value().
+ * timezone. This is the EXCHANGE tz, distinct from the app's display tz
+ * (widget _timezoneApi), which is what makes axis labels drift relative to a
+ * UTC-computed session window.
+ *
+ * Returns the tz name or null when unavailable (older builds, no series
+ * loaded yet) - callers fall back to UTC with the assumption documented in
+ * the response (tz_source: 'utc_default').
+ */
+async function _readSymbolExchangeTz(evaluate) {
+  try {
+    const tz = await evaluate(`
+      (function() {
+        var tz = null;
+        try {
+          var ms = ${CHART_API}._chartWidget.model().mainSeries();
+          var si = null;
+          if (ms && ms._symbolInfo) {
+            try { si = ms._symbolInfo.value ? ms._symbolInfo.value() : ms._symbolInfo.value; } catch (e) {}
+            if (si && !si.timezone && ms._aliasSymbolInfo) {
+              try { si = ms._aliasSymbolInfo.value ? ms._aliasSymbolInfo.value() : ms._aliasSymbolInfo.value; } catch (e) {}
+            }
+            if (si && si.timezone) tz = String(si.timezone);
+          }
+        } catch (e) {}
+        return tz;
+      })()
+    `);
+    // Guard against non-string shapes (mocks, partial objects). IANA zone
+    // names use letters, digits, underscore and '/' (e.g. "America/New_York").
+    // Strict character class: this value is interpolated into page-side JS.
+    if (typeof tz === 'string' && tz.length <= 40 && /^[A-Za-z][A-Za-z0-9_/-]*$/.test(tz)) return tz;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * UTC offset (seconds east) of an IANA timezone at an instant, via Intl.
+ * Returns null when the zone is unknown or Intl lacks tz data - callers
+ * fall back to UTC. (Node has full ICU since v13.)
+ */
+function _tzOffsetSecondsAt(tz, unixSeconds) {
+  try {
+    const d = new Date(unixSeconds * 1000);
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).formatToParts(d);
+    const get = (type) => Number(parts.find(p => p.type === type).value);
+    const asUTC = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+    return Math.round((asUTC - d.getTime()) / 1000);
+  } catch {
+    return null;
+  }
+}
+
 export async function frameChart({
   symbol, timeframe, from, to, date, session, time_zone,
   screenshot, screenshot_region, screenshot_output_dir,
@@ -884,6 +947,9 @@ export async function frameChart({
   let f = null;
   let t = null;
   let sourceDesc = null;
+  let tz_name = null;
+  let tz_source = null;
+  let deferredWindow = null;
 
   if ((from !== undefined && from !== null) || (to !== undefined && to !== null)) {
     if (from === undefined || from === null || to === undefined || to === null) {
@@ -900,10 +966,10 @@ export async function frameChart({
     let sessEnd = null;
     const s = String(session || 'us_regular').toLowerCase();
     if (s === 'us_regular' || s === 'us' || s === 'regular') {
-      // US regular session in exchange-local terms is 09:30–16:00. TV charts
-      // display exchange-local time, so caller passes time_zone only for
-      // ISO conversion; here we default to UTC interpretation unless told
-      // otherwise. Explicit `from`/`to` is the precise form.
+      // US regular session in exchange-local terms is 09:30-16:00. The
+      // window is framed as ABSOLUTE unix seconds below; axis labels follow
+      // the app's display timezone, so they may differ from exchange-local
+      // even when the framed bars are exactly right.
       sessStart = 9 * 3600 + 30 * 60;
       sessEnd = 16 * 3600;
     } else if (s === 'full_day' || s === 'day' || s === '24h') {
@@ -912,14 +978,15 @@ export async function frameChart({
     } else {
       throw new Error(`Unknown session: ${session}. Use us_regular (09:30-16:00), full_day, or pass explicit from/to.`);
     }
-    const offsetSec = time_zone != null ? Number(time_zone) * 3600 : 0;
-    f = dayStart + sessStart - offsetSec;
-    t = dayStart + sessEnd - offsetSec;
-    sourceDesc = `date_session:${session || 'us_regular'}`;
+    // Session hours are exchange-local; finalizing the absolute window needs
+    // the exchange offset, which is read AFTER the symbol is applied (the
+    // chart already knows the symbol when called without an explicit
+    // symbol/timeframe). An explicit `time_zone` offset stays authoritative
+    // and skips the read. Finalization happens below, post-apply.
+    deferredWindow = { dayStart, sessStart, sessEnd };
   } else {
     throw new Error('Provide `from`+`to`, or `date` (+ optional `session`).');
   }
-  if (!(t > f)) throw new Error('`to` must be greater than `from`.');
 
   // ── Apply symbol / timeframe first (framing reads the bar grid) ───────
   let symbolApplied = null;
@@ -935,6 +1002,39 @@ export async function frameChart({
   if (symbol || timeframe) {
     await waitForChartReady(null);
   }
+
+  // ── Finalize the deferred session window with the right offset ────────
+  if (deferredWindow) {
+    const { dayStart, sessStart, sessEnd } = deferredWindow;
+    if (time_zone != null) {
+      // Explicit caller-supplied offset in hours (may be negative) - the
+      // authoritative legacy form: f = wall-clock window start minus the
+      // offset (i.e. -5 shifts the window 5h later in UTC).
+      const offsetSec = Number(time_zone) * 3600;
+      f = dayStart + sessStart - offsetSec;
+      t = dayStart + sessEnd - offsetSec;
+      tz_source = 'explicit_offset';
+    } else {
+      // Resolve in the target symbol's exchange timezone: read the IANA tz
+      // from the loaded main series, then its UTC offset at that day (DST
+      // handled by Intl). Falls back to UTC only when the chart exposes no
+      // tz data - surfaced via tz_source so callers can flag the drift.
+      const tz = await _readSymbolExchangeTz(evaluate);
+      if (tz) {
+        tz_name = tz;
+        const offsetSec = _tzOffsetSecondsAt(tz, dayStart + 12 * 3600);
+        f = dayStart + sessStart - (offsetSec ?? 0);
+        t = dayStart + sessEnd - (offsetSec ?? 0);
+        tz_source = offsetSec != null ? 'exchange_symbol' : 'utc_default';
+      } else {
+        f = dayStart + sessStart;
+        t = dayStart + sessEnd;
+        tz_source = 'utc_default';
+      }
+    }
+    sourceDesc = `date_session:${session || 'us_regular'}`;
+  }
+  if (!(t > f)) throw new Error('`to` must be greater than `from`.');
 
   // ── Extend the bar buffer if `from` predates it ────────────────────────
   const beforeExtend = await evaluate(`
@@ -992,6 +1092,7 @@ export async function frameChart({
     actual_read_failed: probeFailed || undefined,
     actual_read_error: actual.error || undefined,
     ...(cacheNote ? { cache_note: cacheNote } : {}),
+    ...(tz_source ? { tz_source, ...(tz_name ? { tz_name } : {}) } : {}),
     ...(symbol ? { symbol_applied: symbolApplied?.symbol ?? symbolApplied ?? symbol } : {}),
     ...(timeframe ? { timeframe_applied: timeframeApplied?.timeframe ?? timeframeApplied ?? timeframe } : {}),
   };

@@ -54,10 +54,42 @@ describe('core/ui.js — smoke', () => {
         source: 'internal_api',
       }),
     });
-    const r = await ui.layoutList();
+    const r = await ui.layoutList({ _deps: { saved_charts_retry_delay_ms: 0 } });
     assert.equal(r.success, true);
     assert.equal(r.layout_count, 1);
     assert.equal(r.layouts[0].name, 'Day Trading');
+  });
+
+  it('test_layoutList_reports_timeout_error_when_lookup_fails', async () => {
+    // Every retry attempt times out (no fallback source reachable): the list
+    // is empty and the error is surfaced (layoutList has no fallback of its
+    // own — it just shares the retry helper).
+    installCdpMocks({
+      evaluateAsync: async () => ({ layouts: null, error: 'getSavedCharts timed out', source: 'internal_api' }),
+    });
+    const r = await ui.layoutList({ _deps: { saved_charts_attempts: 2, saved_charts_retry_delay_ms: 0 } });
+    assert.equal(r.success, true);
+    assert.equal(r.layout_count, 0);
+    assert.match(r.error, /getSavedCharts timed out/);
+  });
+
+  it('test_layoutList_recovers_a_stall_on_a_later_retry', async () => {
+    // The flaky case: the first two lookups stall (timeout), the third
+    // returns the list — the bounded retry must recover it.
+    const seq = [
+      { layouts: null, error: 'getSavedCharts timed out', source: 'internal_api' },
+      { layouts: null, error: 'getSavedCharts timed out', source: 'internal_api' },
+      { layouts: [{ id: 'L1', name: 'Day Trading', symbol: 'AAPL', resolution: '5' }], source: 'internal_api' },
+    ];
+    let i = 0;
+    installCdpMocks({
+      evaluateAsync: async () => seq[Math.min(i++, seq.length - 1)],
+    });
+    const r = await ui.layoutList({ _deps: { saved_charts_attempts: 3, saved_charts_retry_delay_ms: 0 } });
+    assert.equal(r.layout_count, 1);
+    assert.equal(r.layouts[0].name, 'Day Trading');
+    assert.equal(r.error, undefined);
+    assert.equal(i, 3, 'two failures then a success');
   });
 
   // Shared evaluate() mock for layoutSwitch: the dialog probe returns the
@@ -68,12 +100,40 @@ describe('core/ui.js — smoke', () => {
     return dialog;
   };
 
+  // Staged evaluateAsync() mock: layoutSwitch now makes several page calls in
+  // sequence (saved-list lookup, match, load-by-id, and — only when the
+  // lookup exhausts its retry budget — the layout-picker fallback). Route each
+  // to its configured result by the distinguishing substring in the expression.
+  const switchStages = ({ lookup, match, load, picker }, dialog, verifiedState) => {
+    const log = [];
+    let lookupCalls = 0;
+    const evaluateAsync = async (expr) => {
+      if (expr.includes('matchEntry')) { log.push('match'); return match; }
+      if (expr.includes('loadChartFromServer')) { log.push('load'); return load; }
+      if (expr.includes('save-load-menu')) { log.push('picker'); return picker; }
+      log.push('lookup');
+      if (Array.isArray(lookup)) {
+        const v = lookup[Math.min(lookupCalls, lookup.length - 1)];
+        lookupCalls += 1;
+        return v;
+      }
+      return lookup;
+    };
+    const evaluate = switchEvaluate(dialog, verifiedState);
+    return { evaluateAsync, evaluate, log };
+  };
+
   it('test_layoutSwitch_smoke_no_dialog', async () => {
-    installCdpMocks({
-      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Day Trading', source: 'internal_api' }),
-      evaluate: switchEvaluate({ present: false }, { title: '', header_label: 'Day Trading' }),
-    });
-    const r = await ui.layoutSwitch({ name: 'Day Trading' });
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: 'L1', name: 'Day Trading', url: 'slug1' }], source: 'internal_api' },
+        match: { id: 'L1', name: 'Day Trading', slug: 'slug1' },
+        load: { ok: true, id: 'L1', name: 'Day Trading', slug: 'slug1' },
+      },
+      { present: false }, { title: '', header_label: 'Day Trading' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Day Trading', _deps: { saved_charts_retry_delay_ms: 0 } });
     assert.equal(r.success, true);
     assert.equal(r.layout, 'Day Trading');
     assert.equal(r.layout_id, 'L1');
@@ -81,14 +141,20 @@ describe('core/ui.js — smoke', () => {
     assert.equal(r.method, 'loadChartFromServer');
     assert.equal(r.verified, true);
     assert.equal(r.discarded_unsaved_changes, false);
+    assert.deepEqual(m.log, ['lookup', 'match', 'load'], 'primary path: lookup→match→load, no picker');
   });
 
   it('test_layoutSwitch_smoke_blocked_by_unsaved_dialog', async () => {
-    installCdpMocks({
-      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Day Trading', source: 'internal_api' }),
-      evaluate: switchEvaluate({ present: true, button_text: 'Open anyway' }, { title: '', header_label: 'Day Trading' }),
-    });
-    const r = await ui.layoutSwitch({ name: 'Day Trading' });
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: 'L1', name: 'Day Trading', url: 'slug1' }], source: 'internal_api' },
+        match: { id: 'L1', name: 'Day Trading', slug: 'slug1' },
+        load: { ok: true, id: 'L1', name: 'Day Trading', slug: 'slug1' },
+      },
+      { present: true, button_text: 'Open anyway' }, { title: '', header_label: 'Day Trading' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Day Trading', _deps: { saved_charts_retry_delay_ms: 0 } });
     assert.equal(r.success, false);
     assert.equal(r.unsaved_dialog_present, true);
     assert.equal(r.blocking_button_text, 'Open anyway');
@@ -96,11 +162,16 @@ describe('core/ui.js — smoke', () => {
   });
 
   it('test_layoutSwitch_smoke_discard_opt_in', async () => {
-    installCdpMocks({
-      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Day Trading', source: 'internal_api' }),
-      evaluate: switchEvaluate({ present: true, button_text: 'Discard' }, { title: '', header_label: 'Day Trading' }),
-    });
-    const r = await ui.layoutSwitch({ name: 'Day Trading', discard_unsaved: true });
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: 'L1', name: 'Day Trading', url: 'slug1' }], source: 'internal_api' },
+        match: { id: 'L1', name: 'Day Trading', slug: 'slug1' },
+        load: { ok: true, id: 'L1', name: 'Day Trading', slug: 'slug1' },
+      },
+      { present: true, button_text: 'Discard' }, { title: '', header_label: 'Day Trading' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Day Trading', discard_unsaved: true, _deps: { saved_charts_retry_delay_ms: 0 } });
     assert.equal(r.success, true);
     assert.equal(r.discarded_unsaved_changes, true);
     assert.equal(r.verified, true);
@@ -110,14 +181,19 @@ describe('core/ui.js — smoke', () => {
     // 2026-11-18 bug scenario: loadChartFromServer rejects (404 to
     // /chart/undefined/json/); the page navigates via the slug URL and the
     // title confirms the layout landed.
-    installCdpMocks({
-      evaluateAsync: async () => ({
-        kind: 'switched', method: 'url_navigation', id: '42', name: 'Agent', source: 'internal_api',
-        primary_error: 'loadChartFromServer rejected: HTTP 404 (https://www.tradingview.com/chart/undefined/json/)',
-      }),
-      evaluate: switchEvaluate({ present: false }, { title: 'Live stock, index, futures, Forex and Bitcoin charts on TradingView', header_label: 'Agent' }),
-    });
-    const r = await ui.layoutSwitch({ name: 'Agent' });
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: '42', name: 'Agent', url: 'agSlug' }], source: 'internal_api' },
+        match: { id: '42', name: 'Agent', slug: 'agSlug' },
+        load: {
+          ok: true, method: 'url_navigation', id: '42', name: 'Agent', slug: 'agSlug',
+          primary_error: 'loadChartFromServer rejected: HTTP 404 (https://www.tradingview.com/chart/undefined/json/)',
+        },
+      },
+      { present: false }, { title: 'Live stock, index, futures, Forex and Bitcoin charts on TradingView', header_label: 'Agent' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Agent', _deps: { saved_charts_retry_delay_ms: 0 } });
     assert.equal(r.success, true);
     assert.equal(r.method, 'url_navigation');
     assert.equal(r.layout, 'Agent');
@@ -127,15 +203,96 @@ describe('core/ui.js — smoke', () => {
   });
 
   it('test_layoutSwitch_smoke_both_paths_fail', async () => {
-    installCdpMocks({
-      evaluateAsync: async () => ({
-        id: '42', name: 'Agent', source: 'internal_api',
-        error: 'loadChartFromServer failed and the saved-layout entry has no "url" slug for the URL fallback. Primary error: loadChartFromServer rejected: HTTP 404 (https://www.tradingview.com/chart/undefined/json/)',
-      }),
-    });
+    // Saved-list resolved, entry matched, but loadChartFromServer failed and
+    // the entry has no "url" slug for the URL fallback: a hard failure.
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: '42', name: 'Agent', url: null }], source: 'internal_api' },
+        match: { id: '42', name: 'Agent', slug: null },
+        load: { ok: false, error: 'loadChartFromServer rejected: HTTP 404 (https://www.tradingview.com/chart/undefined/json/)', id: '42', name: 'Agent' },
+      },
+      { present: false }, { title: '', header_label: null },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
     // Same failure contract as "Layout not found": throws with the real
     // reason; CLI/tool wrappers surface it as a failed result.
-    await assert.rejects(ui.layoutSwitch({ name: 'Agent' }), /loadChartFromServer failed.*HTTP 404/);
+    await assert.rejects(ui.layoutSwitch({ name: 'Agent', _deps: { saved_charts_retry_delay_ms: 0 } }), /loadChartFromServer failed.*HTTP 404/);
+  });
+
+  it('test_layoutSwitch_smoke_lookup_exhausted_picker_fallback_succeeds', async () => {
+    // The new flaky-path contract: the saved-list lookup exhausts its retry
+    // budget, so layoutSwitch falls through to the layout picker (clicks the
+    // matching row by name). Verification confirms the switch landed — a
+    // timed-out lookup is NON-fatal, so this is a success.
+    const failLookup = { layouts: null, error: 'getSavedCharts timed out', source: 'internal_api' };
+    const m = switchStages(
+      {
+        lookup: [failLookup, failLookup],
+        match: null,
+        load: null,
+        picker: { ok: true, name: 'Agent', slug: 'agSlug', before_href: 'https://www.tradingview.com/chart/iv1KqN27/', after_href: 'https://www.tradingview.com/chart/agSlug/' },
+      },
+      { present: false }, { title: '', header_label: 'Agent' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Agent', _deps: { saved_charts_attempts: 2, saved_charts_retry_delay_ms: 0, verify_timeout_ms: 400, verify_poll_ms: 100 } });
+    assert.equal(r.success, true);
+    assert.equal(r.method, 'layout_picker');
+    assert.equal(r.layout, 'Agent');
+    assert.equal(r.verified, true);
+    assert.ok(m.log.includes('picker'), 'picker fallback ran after the lookup budget');
+  });
+
+  it('test_layoutSwitch_smoke_lookup_exhausted_picker_also_fails', async () => {
+    // When BOTH the saved-list lookup and the picker fallback fail, only then
+    // is the switch reported as a failure (before any verification).
+    const failLookup = { layouts: null, error: 'getSavedCharts timed out', source: 'internal_api' };
+    const m = switchStages(
+      {
+        lookup: [failLookup, failLookup],
+        match: null, load: null,
+        picker: { error: 'layout "Agent" not found in the layout picker' },
+      },
+      { present: false }, { title: '', header_label: 'DayTradeVP' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Agent', _deps: { saved_charts_attempts: 2, saved_charts_retry_delay_ms: 0 } });
+    assert.equal(r.success, false);
+    assert.equal(r.action, 'lookup_and_fallback_failed');
+    assert.match(r.error, /getSavedCharts timed out/);
+    assert.match(r.error, /layout-picker fallback also failed/);
+  });
+
+  it('test_layoutSwitch_smoke_not_found_in_list', async () => {
+    // The list resolved fine but no entry matches the requested name: a
+    // genuine "not found" input error (throws; does NOT fall to the picker,
+    // because the lookup itself succeeded).
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: '42', name: 'Agent', url: 'agSlug' }], source: 'internal_api' },
+        match: null, load: null, picker: null,
+      },
+      { present: false }, { title: '', header_label: null },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    await assert.rejects(ui.layoutSwitch({ name: 'DoesNotExist', _deps: { saved_charts_retry_delay_ms: 0 } }), /not found/);
+    assert.ok(!m.log.includes('picker'), 'not-found must not fall to the picker');
+  });
+
+  it('test_layoutSwitch_smoke_numeric_id_primary_loads', async () => {
+    // A numeric ID skips the saved-list lookup entirely and loads by ID;
+    // verification is skipped (no name to look for), so verified is null.
+    const m = switchStages(
+      { lookup: null, match: null, load: { ok: true, id: '42', name: null, slug: null }, picker: null },
+      { present: false }, { title: '', header_label: null },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: '42', _deps: { saved_charts_retry_delay_ms: 0 } });
+    assert.equal(r.success, true);
+    assert.equal(r.method, 'loadChartFromServer');
+    assert.equal(r.layout_id, '42');
+    assert.equal(r.verified, null, 'numeric ID path skips verification');
+    assert.ok(!m.log.includes('lookup'), 'numeric path does not read the saved list');
   });
 
   it('test_layoutSwitch_smoke_verification_timeout', async () => {
@@ -143,14 +300,16 @@ describe('core/ui.js — smoke', () => {
     // exactly the false-success the 2026-11-18 bug produced. Mirrors the
     // live 3.4.1 observation: the title stays the static app title and the
     // header label still shows the previous layout.
-    installCdpMocks({
-      evaluateAsync: async () => ({
-        kind: 'switched', method: 'url_navigation', id: '42', name: 'Agent', source: 'internal_api',
-        primary_error: 'loadChartFromServer rejected: HTTP 404',
-      }),
-      evaluate: switchEvaluate({ present: false }, { title: 'Live stock, index, futures, Forex and Bitcoin charts on TradingView', header_label: 'DayTradeVP' }),
-    });
-    const r = await ui.layoutSwitch({ name: 'Agent', _deps: { verify_timeout_ms: 400, verify_poll_ms: 100 } });
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: '42', name: 'Agent', url: 'agSlug' }], source: 'internal_api' },
+        match: { id: '42', name: 'Agent', slug: 'agSlug' },
+        load: { ok: true, method: 'url_navigation', id: '42', name: 'Agent', slug: 'agSlug', primary_error: 'loadChartFromServer rejected: HTTP 404' },
+      },
+      { present: false }, { title: 'Live stock, index, futures, Forex and Bitcoin charts on TradingView', header_label: 'DayTradeVP' },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Agent', _deps: { saved_charts_retry_delay_ms: 0, verify_timeout_ms: 400, verify_poll_ms: 100 } });
     assert.equal(r.success, false);
     assert.equal(r.verified, false);
     assert.equal(r.observed_title, 'Live stock, index, futures, Forex and Bitcoin charts on TradingView');
@@ -165,11 +324,16 @@ describe('core/ui.js — smoke', () => {
     // Older/browser-style build where the header label is absent but the
     // page title carries the layout name — the title remains an accepted
     // additional signal.
-    installCdpMocks({
-      evaluateAsync: async () => ({ kind: 'switched', method: 'loadChartFromServer', id: 'L1', name: 'Scalper', source: 'internal_api' }),
-      evaluate: switchEvaluate({ present: false }, { title: 'TradingView - Scalper', header_label: null }),
-    });
-    const r = await ui.layoutSwitch({ name: 'Scalper' });
+    const m = switchStages(
+      {
+        lookup: { layouts: [{ id: 'L1', name: 'Scalper', url: 'scSlug' }], source: 'internal_api' },
+        match: { id: 'L1', name: 'Scalper', slug: 'scSlug' },
+        load: { ok: true, id: 'L1', name: 'Scalper', slug: 'scSlug' },
+      },
+      { present: false }, { title: 'TradingView - Scalper', header_label: null },
+    );
+    installCdpMocks({ evaluateAsync: m.evaluateAsync, evaluate: m.evaluate });
+    const r = await ui.layoutSwitch({ name: 'Scalper', _deps: { saved_charts_retry_delay_ms: 0 } });
     assert.equal(r.success, true);
     assert.equal(r.verified, true);
   });
