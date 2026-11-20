@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ui_dismiss_popups` (CLI `tv ui dismiss`): first-class, resilient dismissal of
+  TradingView's known marketing overlays that cover the chart — the subscription
+  upsell modal ("Take your subscription to the next level"), the get-realtime-data
+  upgrade prompt, and the new-feature/product tour. Detects each overlay by its
+  known text, dismisses it through the overlay's own dismiss control ("Don't need",
+  "No thanks", …) first with a generic close/X fallback second, then re-detects to
+  confirm the overlay actually cleared. A click that reports success but leaves the
+  overlay mounted, or an overlay with no matching control, is reported as still
+  remaining (with pre-click evidence) rather than claimed as dismissed.
+- `tv ui-state` / `tv_ui_state` now reports an `overlays` block (read-only):
+  which known overlays are still covering the chart, so a frame or screenshot that
+  comes back blocked is diagnosable without re-running the capture. Dismissal never
+  happens on a plain state read — only `tv ui dismiss` / `ui_dismiss_popups` mutate.
+- `capture_screenshot` and `chart_frame` now run a conservative overlay preflight:
+  dismiss a covering marketing overlay first, then proceed, and report
+  `overlays_dismissed` / `overlays_remaining` in the result. The nested
+  screenshot inside `chart_frame` skips the second probe. Preflight is bounded and
+  never throws — a failed dismissal surfaces the remaining overlay instead of
+  guessing.
+
 ## [1.4.0] - 2026-09-20
 
 ### Added

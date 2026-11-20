@@ -302,7 +302,9 @@ describe('captureScreenshot — chart selector chain', () => {
     });
     assert.equal(r.success, true);
     trackFile(r.file_path);
-    const expr = seen.find((e) => typeof e === 'string' && e.includes('querySelector'));
+    // The overlay preflight probe (also querySelector-based) may run first;
+    // the chart-bounds expression is the one carrying the container chain.
+    const expr = seen.find((e) => typeof e === 'string' && e.includes("querySelector('.chart-container')"));
     assert.ok(expr, 'expected a bounds query expression');
     const chain = [
       "querySelector('.chart-container.active')",

@@ -136,7 +136,7 @@ All four post to `pricealerts.tradingview.com` REST. No DOM scraping, returns re
 
 ### "Navigate the UI"
 - `ui_open_panel` (`panel: pine-editor|strategy-tester|watchlist|alerts|trading`, `action: open|close|toggle`)
-- `ui_click` (`by: aria-label|data-name|text|class-contains`, `value`); `ui_hover`, `ui_find_element` (`query`, `strategy`), `ui_mouse_click` (prefer `selector` over raw coords — WSL2/HiDPI scaling), `ui_keyboard` (`key`, `modifiers`), `ui_type_text` (`text`), `ui_scroll` (`direction`, `amount`), `ui_dismiss_dialogs` (safe no-op when clean)
+- `ui_click` (`by: aria-label|data-name|text|class-contains`, `value`); `ui_hover`, `ui_find_element` (`query`, `strategy`), `ui_mouse_click` (prefer `selector` over raw coords — WSL2/HiDPI scaling), `ui_keyboard` (`key`, `modifiers`), `ui_type_text` (`text`), `ui_scroll` (`direction`, `amount`), `ui_dismiss_dialogs` (safe no-op when clean), `ui_dismiss_popups` (dismisses known TV marketing overlays — subscription upsell / get-realtime prompt / new-feature tour — via the overlay's own "Don't need" control with a close/X fallback; reports dismissed vs still-remaining; safe no-op when clean)
 - `layout_list` → saved layouts; `layout_switch` (`name`, `discard_unsaved` defaults safe-refuse)
 - `ui_fullscreen` → toggle fullscreen
 - `capture_screenshot` (`region: "full"|"chart"|"strategy_tester"`)

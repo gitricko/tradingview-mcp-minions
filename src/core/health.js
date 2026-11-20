@@ -3,6 +3,7 @@
  */
 import { getClient as _getClient, getTargetInfo as _getTargetInfo, evaluate as _evaluate, disconnect as _disconnect, CDP_PORT } from '../connection.js';
 import { waitForChartReady as _waitForChartReady } from '../wait.js';
+import { detectPopups as _detectPopups, dismissPopups as _dismissPopups } from './ui.js';
 
 function _resolve(deps) {
   return {
@@ -11,6 +12,8 @@ function _resolve(deps) {
     evaluate: deps?.evaluate || _evaluate,
     disconnect: deps?.disconnect || _disconnect,
     waitForChartReady: deps?.waitForChartReady || _waitForChartReady,
+    detectPopups: deps?.detectPopups || _detectPopups,
+    dismissPopups: deps?.dismissPopups || _dismissPopups,
   };
 }
 import { existsSync, readFileSync } from 'fs';
@@ -152,8 +155,49 @@ export async function discover({ _deps } = {}) {
   return { success: true, apis_available: available, apis_total: total, apis: paths };
 }
 
+// Overlay state reported by tv_ui_state so a blocked frame/screenshot is
+// diagnosable without re-running the capture. Read-only by default:
+// `dismiss` opts into dismissal (used by `tv ui dismiss`), otherwise a
+// ui-state call must never mutate the chart. Detection failures are
+// reported rather than thrown — a missing overlay block must not break
+// the whole state snapshot.
+// `deps` here is the resolved-dependency record (evaluate, detectPopups,
+// dismissPopups) already assembled by uiState/_resolve; passing it straight
+// through keeps test injection working through both entry points.
+export async function overlayState(dismiss = false, deps = undefined) {
+  const detectPopups = deps?.detectPopups || _detectPopups;
+  const dismissPopups = deps?.dismissPopups || _dismissPopups;
+  const out = { present: false, dismissed: [], remaining: [] };
+  const inject = deps?.evaluate ? { evaluate: deps.evaluate } : undefined;
+  let detected = [];
+  try { detected = await detectPopups(inject); }
+  catch (err) { return { ...out, error: err.message }; }
+  out.present = detected.length > 0;
+  if (!dismiss || !out.present) {
+    out.remaining = detected;
+    return out;
+  }
+  try {
+    const res = await dismissPopups(inject);
+    out.dismissed = res.dismissed || [];
+    out.remaining = res.remaining || [];
+    out.present = out.remaining.length > 0;
+  } catch (err) {
+    // Dismissal failed: keep the pre-click evidence and say so — never
+    // guess that an overlay we could not clear is gone.
+    out.remaining = detected;
+    out.present = true;
+    out.error = err.message;
+  }
+  return out;
+}
+
 export async function uiState({ _deps } = {}) {
-  const { evaluate } = _resolve(_deps);
+  const deps = _resolve(_deps);
+  const { evaluate } = deps;
+  let overlays = { present: false, remaining: [] };
+  try { overlays = await overlayState(false, deps); }
+  catch { /* never break the state snapshot on overlay detection */ }
   const state = await evaluate(`
     (function() {
       var ui = {};
@@ -221,7 +265,14 @@ export async function uiState({ _deps } = {}) {
     })()
   `);
 
-  return { success: true, ...state };
+  return {
+    success: true,
+    ...state,
+    // Known overlays still on screen (subscription upsell, get-realtime
+    // prompt, new-feature tour). Non-empty here means any frame or
+    // screenshot taken right now documents the overlay, not the chart.
+    overlays,
+  };
 }
 
 export async function launch({ port, kill_existing } = {}) {

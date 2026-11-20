@@ -215,7 +215,7 @@ tv pane list/layout/focus/symbol/timeframe/read-batch
 tv tab list/new/close/switch/pin/unpin/registry
 tv replay start/step/stop/status/autoplay/trade/set-resolution
 tv stream quote/bars/values/lines/labels/tables/all
-tv ui click/keyboard/hover/scroll/find/type/panel/fullscreen/mouse
+tv ui click/keyboard/hover/scroll/find/type/panel/fullscreen/mouse/dismiss/dialogs
 tv hotlist / screener / news / snapshot
 tv strategy set-deep-bt-range
 tv screenshot / discover / ui-state / range / scroll
@@ -256,7 +256,7 @@ Claude reads [`CLAUDE.md`](CLAUDE.md) automatically when working in this project
 | "Draw a level at 24500" | `draw_shape` (horizontal_line) |
 | "Take a screenshot" | `capture_screenshot` |
 
-## Tool Reference (108 MCP tools)
+## Tool Reference (116 MCP tools)
 
 ### Chart Reading
 
@@ -430,6 +430,7 @@ Read backtest results from a Pine Script strategy on the chart. The Strategy Tes
 | `ui_find_element` | Find UI elements and return positions |
 | `ui_fullscreen` | Toggle fullscreen |
 | `ui_dismiss_dialogs` | Detect and dismiss blocking modals (Leave-replay, unsaved-changes, Save-script) |
+| `ui_dismiss_popups` | Dismiss known marketing overlays covering the chart (subscription upsell, get-realtime prompt, new-feature tour) via the overlay's own "Don't need" control with a close/X fallback; reports dismissed vs still-remaining. Read-only detection: `tv_ui_state` |
 | `layout_list` / `layout_switch` | Manage saved layouts |
 | `capture_screenshot` | Screenshot (regions: full, chart, strategy_tester) |
 
