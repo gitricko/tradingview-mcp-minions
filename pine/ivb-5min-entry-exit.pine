@@ -1,0 +1,158 @@
+//@version=6
+indicator("IVB 5-min Entry/Exit Model", overlay=true, max_labels_count=500, max_boxes_count=100)
+
+// ───────────────────────────────────────────────────────────────────────────
+// IVB 5-minute Entry/Exit model — indicator (signal marking only).
+//
+// Rules (long only, per symbol; TQQQ and SQQQ are traded independently):
+//   • OR         = high/low of the first six regular-session 5-minute bars,
+//                  i.e. the 09:30-10:00 window in the SYMBOL'S EXCHANGE
+//                  TIMEZONE (syminfo.timezone), not a naive time prefix.
+//   • Break  B   = regular bar at/after 10:00 exchange-local with
+//                  close(B) > OR_high AND close(B-1) <= OR_high
+//                  (close-confirmed fresh cross; an intrabar wick poke does
+//                  not count).
+//   • Confirm C  = the bar immediately after B; valid only when
+//                  close(C) > high(B) (the whole break bar, wick included).
+//   • Entry      = close(C).
+//   • R          = high(C) - low(C) (the full range of the entry bar).
+//   • Stop       = entry - R, Target = entry + R (1:1).
+//   • Re-arm     = a failed confirmation leaves the symbol eligible; a later
+//                  fresh break of the same day's OR_high starts a new setup.
+//   • Daily limit= once an entered trade has exited (target, stop or the
+//                  end-of-session time stop) the symbol takes no further
+//                  trades that day.
+//
+// This Pine file is a line-by-line transcription of the shared plain-JS
+// reference implementation `src/core/ivb.js` (single source of truth for the
+// rules) — see `tests/ivb.test.js` for the synthetic case suite and
+// `tests/ivb_pine_consistency.test.js` for the static consistency check.
+//
+// Scope: indicator only. No strategy/backtest variant, no trailing exit,
+// no sizing, no filters, no multi-symbol scanning.
+// ───────────────────────────────────────────────────────────────────────────
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+// Defaults mirror src/core/ivb.js (OR_START_MINUTE / OR_END_MINUTE /
+// SESSION_END_MINUTE / OR_BAR_COUNT) and are checked by the static
+// consistency test.
+i_orStartMin = input.int(570, "OR start minute (exchange local)", minval=0, maxval=1439)
+i_orEndMin   = input.int(600, "OR end minute (exchange local)", minval=1, maxval=1440)
+i_sessionEnd = input.int(960, "Session close minute (exchange local)", minval=1, maxval=1440)
+i_orBarCount = input.int(6, "OR bar count (5-minute bars)", minval=1)
+i_showBand   = input.bool(true, "Shade opening-range band")
+i_showBox    = input.bool(true, "Draw entry/stop/target box")
+i_greyDone   = input.bool(true, "Grey out symbol after a completed trade")
+
+// ── Exchange-local calendar ───────────────────────────────────────────────
+// The exchange timezone of the SYMBOL, never a naive bar-time prefix.
+i_tz = syminfo.timezone
+i_barMinute = hour(time, i_tz) * 60 + minute(time, i_tz)
+i_dayKey = year(time, i_tz) * 10000 + month(time, i_tz) * 100 + dayofmonth(time, i_tz)
+
+// Regular-session bars only: 09:30 <= minute < 16:00 exchange-local.
+i_inRegular = i_barMinute >= i_orStartMin and i_barMinute < i_sessionEnd
+i_newDay = i_dayKey != nz(i_dayKey[1], i_dayKey)
+
+// ── State ─────────────────────────────────────────────────────────────────
+// 0 = scanning, 1 = break seen (waiting for the confirmation bar),
+// 2 = in trade, 3 = done for the day (a completed trade).
+var int    state = 0
+var float  orHigh = na
+var float  orLow = na
+var int    orBars = 0
+var float  pendingBreakHigh = na
+var float  entryPrice = na
+var float  riskR = na
+var float  stopPrice = na
+var float  targetPrice = na
+var int    entryBarIdx = na
+var box    riskBox = na
+var box    targetBox = na
+
+// Reset per trading day.
+if i_newDay
+    state := 0
+    orHigh := na
+    orLow := na
+    orBars := 0
+    pendingBreakHigh := na
+    entryPrice := na
+    riskR := na
+    stopPrice := na
+    targetPrice := na
+    entryBarIdx := na
+    riskBox := na
+    targetBox := na
+
+// ── Opening range accumulation (regular-session bars only) ───────────────
+if i_inRegular and i_barMinute < i_orEndMin
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+    orBars += 1
+
+i_orComplete = orBars >= i_orBarCount
+
+// ── 1. Resolve an open position first (stop/target before new setups) ───
+if state == 2
+    stopHit = low <= stopPrice
+    targetHit = high >= targetPrice
+    if stopHit or targetHit
+        // Pessimistic fill: when both are inside the bar's range, the stop
+        // is assumed first (§10.4).
+        exitPrice = stopHit ? stopPrice : targetPrice
+        exitReason = stopHit ? "stop" : "target"
+        state := 3
+        if not na(riskBox)
+            box.set_right(riskBox, bar_index + 1)
+        if not na(targetBox)
+            box.set_right(targetBox, bar_index + 1)
+        label.new(bar_index, exitPrice, (exitReason == "stop" ? "STOP" : "TARGET"), style=label.style_label_left, color=color.new(exitReason == "stop" ? color.red : color.green, 15), textcolor=color.white, size=size.tiny)
+
+// ── 2. Confirmation bar C = B + 1 ─────────────────────────────────────────
+if state == 1
+    if close > pendingBreakHigh
+        // Valid confirmation: enter at the close of this bar.
+        entryPrice := close
+        riskR := high - low
+        stopPrice := entryPrice - riskR
+        targetPrice := entryPrice + riskR
+        entryBarIdx := bar_index
+        state := 2
+        plotshape(close, title="Valid confirmation", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="C")
+        if i_showBox
+            riskBox := box.new(entryBarIdx, entryPrice, bar_index + 1, stopPrice, border_color=color.new(color.red, 0), border_width=1, bgcolor=color.new(color.red, 85))
+            targetBox := box.new(entryBarIdx, targetPrice, bar_index + 1, entryPrice, border_color=color.new(color.green, 0), border_width=1, bgcolor=color.new(color.green, 85))
+        label.new(bar_index, entryPrice, "ENTRY " + str.tostring(entryPrice, format.mintick), style=label.style_label_left, color=color.new(color.blue, 10), textcolor=color.white, size=size.tiny)
+    else
+        // Invalidated: no trade, the symbol stays eligible (re-arm allowed).
+        state := 0
+        plotshape(close, title="Invalidated confirmation", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.small, text="X")
+    pendingBreakHigh := na
+
+// ── 3. Break bar B: close-confirmed fresh cross of OR_high ──────────────
+if state == 0 and i_inRegular and i_orComplete and i_barMinute >= i_orEndMin
+    if close > orHigh and close[1] <= orHigh
+        pendingBreakHigh := high
+        state := 1
+        plotshape(high, title="Break bar", style=shape.triangleup, location=location.abovebar, color=color.aqua, size=size.tiny, text="B")
+
+// ── 4. Time stop: flat by the end of the regular session ─────────────────
+if state == 2 and i_barMinute + 5 >= i_sessionEnd
+    state := 3
+    if not na(riskBox)
+        box.set_right(riskBox, bar_index + 1)
+    if not na(targetBox)
+        box.set_right(targetBox, bar_index + 1)
+    label.new(bar_index, close, "EOD", style=label.style_label_left, color=color.new(color.gray, 10), textcolor=color.white, size=size.tiny)
+
+// ── 5. Plots ─────────────────────────────────────────────────────────────
+i_showOr = i_inRegular and i_orComplete
+p_orHigh = plot(i_showOr ? orHigh : na, title="OR high", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+p_orLow = plot(i_showOr ? orLow : na, title="OR low", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+fill(p_orHigh, p_orLow, color=i_showBand ? color.new(color.aqua, 85) : na, title="OR band")
+
+// Grey out the symbol once a trade has completed (§7: done for the day).
+i_done = state == 3
+plotshape(i_done and i_greyDone ? low : na, title="Done for the day", style=shape.square, location=location.belowbar, color=color.new(color.gray, 40), size=size.tiny)
+bgcolor(i_done and i_greyDone ? color.new(color.gray, 92) : na, title="Done shading")
