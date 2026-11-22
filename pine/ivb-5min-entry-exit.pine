@@ -57,7 +57,25 @@ i_newDay = i_dayKey != nz(i_dayKey[1], i_dayKey)
 // ── State ─────────────────────────────────────────────────────────────────
 // 0 = scanning, 1 = break seen (waiting for the confirmation bar),
 // 2 = in trade, 3 = done for the day (a completed trade).
+//
+// Per-bar marking series. TradingView forbids plotshape() (and every other
+// plot* call) in local scope — `plotshape(...)` inside an `if` block is a
+// hard compile error, "Cannot use \"{functionName}\" in local scope", even
+// though the offline analyzer accepts it. The state blocks below therefore
+// only RECORD the price a marking belongs at; the plots themselves are
+// issued once, at global scope, in step 5.
 var int    state = 0
+var float  markBreak = na
+var float  markConf = na
+var float  markInvalid = na
+
+// Cleared at the start of every bar: a variable assigned only inside a
+// conditional block keeps its previous value on the bars where that block
+// does not run, so the explicit reset is what keeps each marking firing on
+// the bar that produced it and nowhere else.
+markBreak := na
+markConf := na
+markInvalid := na
 var float  orHigh = na
 var float  orLow = na
 var int    orBars = 0
@@ -119,7 +137,7 @@ if state == 1
         targetPrice := entryPrice + riskR
         entryBarIdx := bar_index
         state := 2
-        plotshape(close, title="Valid confirmation", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="C")
+        markConf := close
         if i_showBox
             riskBox := box.new(entryBarIdx, entryPrice, bar_index + 1, stopPrice, border_color=color.new(color.red, 0), border_width=1, bgcolor=color.new(color.red, 85))
             targetBox := box.new(entryBarIdx, targetPrice, bar_index + 1, entryPrice, border_color=color.new(color.green, 0), border_width=1, bgcolor=color.new(color.green, 85))
@@ -127,7 +145,7 @@ if state == 1
     else
         // Invalidated: no trade, the symbol stays eligible (re-arm allowed).
         state := 0
-        plotshape(close, title="Invalidated confirmation", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.small, text="X")
+        markInvalid := close
     pendingBreakHigh := na
 
 // ── 3. Break bar B: close-confirmed fresh cross of OR_high ──────────────
@@ -135,7 +153,7 @@ if state == 0 and i_inRegular and i_orComplete and i_barMinute >= i_orEndMin
     if close > orHigh and close[1] <= orHigh
         pendingBreakHigh := high
         state := 1
-        plotshape(high, title="Break bar", style=shape.triangleup, location=location.abovebar, color=color.aqua, size=size.tiny, text="B")
+        markBreak := high
 
 // ── 4. Time stop: flat by the end of the regular session ─────────────────
 if state == 2 and i_barMinute + 5 >= i_sessionEnd
@@ -149,6 +167,11 @@ if state == 2 and i_barMinute + 5 >= i_sessionEnd
 // ── 5. Plots ─────────────────────────────────────────────────────────────
 i_showOr = i_inRegular and i_orComplete
 p_orHigh = plot(i_showOr ? orHigh : na, title="OR high", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+
+// ── Markings (global scope only; the blocks above set the series) ───────
+plotshape(markBreak, title="Break bar", style=shape.triangleup, location=location.abovebar, color=color.aqua, size=size.tiny, text="B")
+plotshape(markConf, title="Valid confirmation", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="C")
+plotshape(markInvalid, title="Invalidated confirmation", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.small, text="X")
 p_orLow = plot(i_showOr ? orLow : na, title="OR low", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
 fill(p_orHigh, p_orLow, color=i_showBand ? color.new(color.aqua, 85) : na, title="OR band")
 

@@ -35,6 +35,55 @@ function pineInputInt(name) {
   return Number(m[1]);
 }
 
+/**
+ * Find every `plot*` call that TradingView would reject as being in local
+ * scope.
+ *
+ * Pine blocks are indentation-based: a block is the run of lines indented
+ * deeper than its header. A plot* call is therefore in local scope when it
+ * sits at an indentation level deeper than the file's top level.
+ *
+ * TradingView's compiler fails such a call with
+ *   Cannot use "{functionName}" in local scope
+ * The repository's offline Pine analyzer (src/core/pine.js) does NOT catch
+ * this class of build-time error, which is why the check lives here.
+ *
+ * @param {string} source - Pine source to scan.
+ * @returns {Array<{line:number, call:string, indent:number, text:string}>}
+ */
+function findLocalScopePlotCalls(source) {
+  const PLOT_CALL = /\b(plot|plotshape|plotchar|plotarrow|plotcandle|plotbar|plotarea|plotkline)\s*\(/;
+  const offenders = [];
+  let baseIndent = null;
+
+  for (const [i, raw] of source.split('\n').entries()) {
+    const line = raw.replace(/\/\/.*$/, '');
+    if (!line.trim()) continue;
+
+    const indent = line.length - line.trimStart().length;
+    if (baseIndent === null) {
+      // The first code line establishes the file's top-level indentation.
+      baseIndent = indent;
+    }
+    if (indent < baseIndent) {
+      // De-dented back to (or past) the top level — e.g. a `for` header.
+      baseIndent = indent;
+    }
+
+    const plotCall = line.match(PLOT_CALL);
+    if (plotCall && indent > baseIndent) {
+      offenders.push({
+        line: i + 1,
+        call: plotCall[1],
+        indent,
+        text: line.trim(),
+      });
+    }
+  }
+
+  return offenders;
+}
+
 describe('ivb Pine/JS static consistency', () => {
   it('is a Pine v6 overlay indicator', () => {
     assert.match(pineSource, /^\/\/@version=6\b/m);
@@ -103,7 +152,9 @@ describe('ivb Pine/JS static consistency', () => {
   });
 
   it('re-arms after an invalidated confirmation (state returns to scanning)', () => {
-    assert.match(pineSource, /state := 0\n {8}plotshape\(close, title="Invalidated confirmation"/);
+    // The invalidation is recorded on a marking series; the plotshape() call
+    // itself lives at global scope (see the local-scope plot guard below).
+    assert.match(pineSource, /state := 0\n {8}markInvalid := close/);
     assert.match(jsSource, /setup\.outcome = 'invalidated'/);
   });
 
@@ -127,6 +178,69 @@ describe('ivb Pine/JS static consistency', () => {
     assert.match(pineSource, /title="Valid confirmation"/);
     assert.match(pineSource, /title="Invalidated confirmation"/);
     assert.match(pineSource, /title="Done for the day"/);
+  });
+
+  it('records each marking on its own series so the plots stay at global scope', () => {
+    // The three event markings are recorded into dedicated series inside the
+    // state blocks and plotted once at global scope. Keeping the series names
+    // in sync with the plots is what stops a future edit from re-introducing
+    // an inline plotshape() (which TradingView rejects — see the local-scope
+    // plot guard below).
+    assert.match(pineSource, /markBreak := high/);
+    assert.match(pineSource, /markConf := close/);
+    assert.match(pineSource, /markInvalid := close/);
+    assert.match(pineSource, /plotshape\(markBreak, title="Break bar"/);
+    assert.match(pineSource, /plotshape\(markConf, title="Valid confirmation"/);
+    assert.match(pineSource, /plotshape\(markInvalid, title="Invalidated confirmation"/);
+  });
+
+  it('issues every plot* call at global scope (TradingView rejects local-scope plots)', () => {
+    // Regression guard for the bug this file shipped with: TradingView's own
+    // compiler fails a plotshape() placed inside an `if` block with
+    //   Cannot use "{functionName}" in local scope
+    // (line 122 / 130 / 138 of the original file), while the offline Pine
+    // analyzer in src/core/pine.js accepts it. The offline analyzer cannot
+    // catch this class of build-time error, so this check guards it here.
+    const offenders = findLocalScopePlotCalls(pineSource);
+    assert.deepEqual(
+      offenders,
+      [],
+      `plot* calls must be at global scope; TradingView rejects local-scope plots: ${JSON.stringify(offenders)}`
+    );
+  });
+
+  it('the local-scope plot guard detects the original (pre-fix) compile error', () => {
+    // Negative test: the guard above must actually catch the bug it guards
+    // against. This reconstructs the three offending calls exactly as the
+    // original file had them — `plotshape(...)` nested inside the state
+    // blocks — and asserts the guard flags all three.
+    const brokenSnippet = [
+      '//@version=6',
+      'indicator("broken", overlay=true)',
+      'var int state = 0',
+      'if state == 1',
+      '    if close > pendingBreakHigh',
+      '        state := 2',
+      '        plotshape(close, title="Valid confirmation")',
+      '    else',
+      '        state := 0',
+      '        plotshape(close, title="Invalidated confirmation")',
+      'if state == 0',
+      '    if close > orHigh',
+      '        state := 1',
+      '        plotshape(high, title="Break bar")',
+    ].join('\n');
+
+    const offenders = findLocalScopePlotCalls(brokenSnippet);
+    assert.equal(offenders.length, 3, `expected 3 local-scope plot calls, got ${JSON.stringify(offenders)}`);
+    assert.deepEqual(
+      offenders.map((o) => o.call),
+      ['plotshape', 'plotshape', 'plotshape']
+    );
+    assert.deepEqual(
+      offenders.map((o) => o.line),
+      [7, 10, 14]
+    );
   });
 
   it('passes the repository offline Pine static analyzer without errors', () => {

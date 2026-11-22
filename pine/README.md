@@ -30,6 +30,44 @@ independently.
 The exchange timezone comes from `syminfo.timezone`, so the opening range is
 resolved from the symbol's exchange, not from a naive bar-time prefix.
 
+## Compiling on TradingView
+
+TradingView's own compiler rejects a `plot*` call issued in **local scope**
+(i.e. inside an `if` / `for` / `while` block) with:
+
+```
+Cannot use "{functionName}" in local scope
+```
+
+The repository's offline Pine analyzer (`src/core/pine.js`) does **not** catch
+this class of build-time error, so the file was shipped once with three
+`plotshape()` calls nested in the state blocks and failed to compile on
+TradingView (lines 122 / 130 / 138 of the original file).
+
+The indicator therefore records each event marking into its own series
+(`markBreak` / `markConf` / `markInvalid`) inside the state blocks, and issues
+the `plotshape()` calls **once, at global scope**. The per-bar reset
+(`markBreak := na` and friends, before the state blocks) is what keeps each
+marking firing on the bar that produced it and nowhere else.
+
+`tests/ivb_pine_consistency.test.js` guards this: it fails if any `plot*`
+call is nested in a block, and carries a negative test proving the guard
+detects the original three offending calls.
+
+To compile against the real compiler:
+
+```bash
+# Server-side TradingView compiler (pine-facade) — no chart needed.
+TV_CDP_HOST=<host> TV_CDP_PORT=9222 node src/cli/index.js pine check \
+  --file pine/ivb-5min-entry-exit.pine
+# -> { "compiled": true, "error_count": 0, "warning_count": 0 }
+
+# Or push it to the live editor and compile there.
+TV_CDP_HOST=<host> TV_CDP_PORT=9222 node src/cli/index.js pine set \
+  --file pine/ivb-5min-entry-exit.pine
+TV_CDP_HOST=<host> TV_CDP_PORT=9222 node src/cli/index.js pine compile
+```
+
 ## Running the tests
 
 ```bash
@@ -40,5 +78,6 @@ npm run test:offline      # full offline regression suite
 ```
 
 The Pine source cannot be executed locally; its correctness is established by
-the shared JS reference plus the static consistency check. Live chart
-reconciliation is a separate task.
+the shared JS reference plus the static consistency check, and by compiling it
+against TradingView's own compiler (see **Compiling on TradingView** above).
+Live chart reconciliation is a separate task.
