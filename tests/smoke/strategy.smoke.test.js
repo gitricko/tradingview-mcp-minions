@@ -1,10 +1,64 @@
-import { describe, it, after } from 'node:test';
+import { describe, it, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { installCdpMocks, resetCdpMocks, cleanupConnection } from '../helpers/mock-cdp.js';
 import * as strategy from '../../src/core/strategy.js';
 
+/**
+ * Client-side (mockable) smoke tests for the deep-backtest range picker.
+ * The real DOM contract was verified live; these tests lock in the failure
+ * branches and the request→result contract, without a live TradingView.
+ *
+ * The page-side `evaluate` expressions are identified by a stable marker so
+ * one mock answer table can serve a whole run regardless of call order.
+ */
+const noopClient = () => ({ Input: { dispatchMouseEvent: async () => {} }, close: async () => {} });
+
+/** Classify a page-side expression by the marker it must contain. */
+function classify(expr) {
+  const s = expr.replace(/\s+/g, ' ');
+  if (s.includes('legendRow-')) return 'legend';                  // getEquitySummary
+  if (s.includes('__findPanel')) return 'scratch';                 // readDeepStats scrape
+  if (s.includes('role="tab"')) return 'tabswitch';
+  if (s.includes('var n = 0;')) return 'inputsProbe';          // inputs-mounted probe
+  if (s.includes('first available')) return 'anchor';          // "Select first available date"
+  if (s.includes('return document.activeElement === el')) return 'focus';
+  if (s.includes('var arrows = [].slice.call')) return 'shownMonth';
+  if (s.includes('var dir = "next"') || s.includes('var dir = "previous"')) return 'arrowClick';
+  if (s.includes('var els = [].slice.call(document.querySelectorAll')) return 'dayClick';
+  if (s.includes('setter.call(el,')) return 'setInput';
+  if (s.includes('Select|S\u00e9lectionner')) return 'submitProbe';
+  if (s.includes('Custom date range')) return 'customItem';
+  if (s.includes('Open strategy report')) return 'ensurePanel';
+  return 'rangeBtn';
+}
+
+/** Default answers for a clean run. Individual tests override specific tags. */
+function baseAnswers(overrides = {}) {
+  return {
+    scratch: { ok: true, deep: true, mode: 'deep', range: 'Jan 1, 2024 — Dec 31, 2024',
+      key_stats: { 'Total PnL': '1.00USD' }, analysis_cards: {}, trade_count: '10',
+      recomputing: false, source: 'dom' },
+    tabswitch: { ok: true, x: 1, y: 1, dpr: 1 },
+    inputsProbe: 2,
+    anchor: { ok: true },
+    focus: true,
+    shownMonth: { year: 2024, month: 1, arrow: 'Next month, February 2024' },
+    arrowClick: true,
+    dayClick: { ok: true, aria: 'Monday 1 January 2024' },
+    setInput: { ok: true, value: '2024-01-01' },
+    submitProbe: { from: '2024-01-01', to: '2024-12-31', hasSelect: true, selected: true, selectText: 'Select' },
+    customItem: { ok: true, x: 5, y: 5, dpr: 1 },
+    ensurePanel: { open: true },
+    rangeBtn: { ok: true, x: 10, y: 10, dpr: 1 },
+    ...overrides,
+  };
+}
+
 describe('core/strategy.js — smoke', () => {
+  beforeEach(() => { resetCdpMocks(); });
   after(async () => { resetCdpMocks(); await cleanupConnection(); });
+
+  // ── R2 — strategy_set_deep_bt_range ────────────────────────────────
 
   it('test_setDeepBacktestRange_smoke_validates_ymd', async () => {
     await assert.rejects(
@@ -27,53 +81,316 @@ describe('core/strategy.js — smoke', () => {
   });
 
   it('test_setDeepBacktestRange_smoke_modal_input_timeout', async () => {
-    let n = 0;
     installCdpMocks({
-      evaluate: async () => {
-        n++;
-        if (n === 1) return { ok: true, text: '2024-01-01 — 2024-06-30' };
-        return 0;  // never reaches 2 visible inputs
+      evaluate: async (expr) => {
+        const tag = classify(expr);
+        if (tag === 'inputsProbe') return 0;
+        return baseAnswers()[tag];
       },
+      getClient: noopClient,
     });
     const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
     assert.equal(r.success, false);
     assert.match(r.error, /modal did not open/);
   });
 
-  it('test_setDeepBacktestRange_smoke_happy_path', async () => {
-    let n = 0;
+  it('test_setDeepBacktestRange_smoke_anchor_button_missing', async () => {
     installCdpMocks({
-      evaluate: async () => {
-        n++;
-        if (n === 1) return { ok: true, text: '2023-01-01 — 2023-06-30' };  // picker open
-        if (n === 2) return 2;                                                // inputs-mounted probe
-        if (n === 3) return { ok: true, set_from: '2024-01-01', set_to: '2024-12-31', modal_found: true };  // fill
-        if (n === 4) return { ready: true, text: 'Select' };                  // submit-enable probe
-        if (n === 5) return { ok: true, set_from: '2024-01-01', button: 'Select' };  // click
-        return { displayed: '2024-01-01 — 2024-12-31' };                      // verify
+      evaluate: async (expr) => {
+        const a = baseAnswers({ anchor: { ok: false, error: '"Select first available date" button not found' } });
+        return a[classify(expr)];
       },
-    });
-    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
-    assert.equal(r.success, true);
-    assert.equal(r.set_inputs.from, '2024-01-01');
-    assert.equal(r.set_inputs.to, '2024-12-31');
-    assert.equal(r.submit_button, 'Select');
-    assert.match(r.displayed, /2024-01-01/);
-  });
-
-  it('test_setDeepBacktestRange_smoke_submit_disabled', async () => {
-    let n = 0;
-    installCdpMocks({
-      evaluate: async () => {
-        n++;
-        if (n === 1) return { ok: true };                                                // picker open
-        if (n === 2) return 2;                                                           // inputs-mounted probe
-        if (n === 3) return { ok: true, set_from: '2024-01-01', set_to: '2024-12-31', modal_found: true };  // fill
-        return { ready: false, error: 'submit button never enabled (date range may be invalid)' };          // 20 polls all disabled
-      },
+      getClient: noopClient,
     });
     const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
     assert.equal(r.success, false);
-    assert.match(r.error, /never enabled|disabled/);
+    assert.match(r.error, /Select first available date/);
+  });
+
+  it('test_setDeepBacktestRange_smoke_day_cell_not_found', async () => {
+    // Nothing else fails, so the run depends entirely on the day-cell click.
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const a = baseAnswers({ dayClick: { ok: false, error: 'day cell not found: Wednesday 1 January 2024' } });
+        return a[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
+    assert.equal(r.success, false);
+    assert.match(r.error, /day cell not found/);
+  });
+
+  it('test_setDeepBacktestRange_smoke_select_stays_disabled', async () => {
+    // shownMonth advances a month per call so the arrow walk converges; the
+    // end date (2026-12-31) is then out of range and the submit probe
+    // reports Select disabled — TradingView clamps it to the last bar.
+    let monthCursor = { year: 2024, month: 1 };
+    const nextMonth = () => {
+      const cur = { ...monthCursor };
+      monthCursor = monthCursor.month === 12
+        ? { year: monthCursor.year + 1, month: 1 }
+        : { year: monthCursor.year, month: monthCursor.month + 1 };
+      return { ...cur, arrow: 'stub' };
+    };
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const tag = classify(expr);
+        if (tag === 'shownMonth') return nextMonth();
+        const a = baseAnswers({
+          submitProbe: { from: '2024-01-01', to: '2026-11-27', hasSelect: true, selected: false, selectText: 'Select' },
+        });
+        return a[tag];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2026-11-27' });
+    assert.equal(r.success, false);
+    assert.match(r.error, /Select button still disabled|outside the available chart range/);
+    assert.equal(r.stage, 'select-disabled');
+  });
+
+  it('test_setDeepBacktestRange_smoke_happy_path', async () => {
+    // shownMonth returns the month each date needs, so no arrow walking
+    // happens. readDeepStats's scratch() is served a settled snapshot; two
+    // identical reads satisfy the "stats settled" exit condition.
+    const requested = ['2024-01-01', '2024-12-31'];
+    let pickIdx = 0;
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const tag = classify(expr);
+        if (tag === 'shownMonth') {
+          const date = requested[pickIdx++];
+          const [y, m] = date.split('-').map(Number);
+          return { year: y, month: m, arrow: 'stub' };
+        }
+        if (tag === 'inputsProbe') return 2;
+        const a = baseAnswers();
+        return a[tag] ?? undefined;
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
+    assert.equal(r.success, true);
+    assert.deepEqual(r.requested, { from: '2024-01-01', to: '2024-12-31' });
+    assert.deepEqual(r.set_inputs, { from: '2024-01-01', to: '2024-12-31' });
+    assert.equal(r.submit_button, 'Select');
+    assert.match(r.display_range, /2024/);
+    assert.equal(typeof r.evidence.stats_moved, 'boolean');
+    assert.ok(r.evidence.before && r.evidence.after);
+  });
+});
+/** Mock answers for the read/write tools (R1/R6/R3/R4). */
+const readAnswers = {
+  tabswitch: { ok: true, x: 1, y: 1, dpr: 1 },
+  scratch: { ok: true, deep: true, mode: 'deep', range: 'Feb 11, 2010 — Nov 27, 2026',
+    key_stats: { 'Total PnL': '-33,961.90USD', 'Profit factor': '0.909' },
+    analysis_cards: { 'Max drawdown as % of initial capital': '48.59%' },
+    trade_count: '1,775', recomputing: false, source: 'dom' },
+};
+
+describe('core/strategy.js — deep reads (smoke)', () => {
+  beforeEach(() => { resetCdpMocks(); });
+  after(async () => { resetCdpMocks(); await cleanupConnection(); });
+
+  // ── R1 — strategy_read_deep_stats ─────────────────────────────────
+
+  it('test_readDeepStats_smoke_returns_mode_tagged_cards', async () => {
+    installCdpMocks({ evaluate: async (expr) => readAnswers[classify(expr)] });
+    const r = await strategy.readDeepStats({});
+    assert.equal(r.success, true);
+    assert.equal(r.mode, 'deep');
+    assert.equal(r.deep, true);
+    assert.equal(r.key_stats['Total PnL'], '-33,961.90USD');
+    assert.equal(r.trade_count, '1,775');
+    assert.equal(r.recomputing, false);
+    assert.equal(r.source, 'dom');
+  });
+
+  it('test_readDeepStats_smoke_never_returns_literal_undefined', async () => {
+    // Cards whose value is missing mid-refresh must not serialise to
+    // "undefined"; the card is dropped and recomputing is flagged instead.
+    installCdpMocks({
+      evaluate: async () => ({
+        ok: true, deep: true, mode: 'deep', range: 'Feb 11, 2010 — Nov 27, 2026',
+        key_stats: { 'Total PnL': '1.00USD' }, analysis_cards: {},
+        trade_count: '5', recomputing: false, source: 'dom',
+      }),
+    });
+    const r = await strategy.readDeepStats({});
+    assert.doesNotMatch(JSON.stringify(r.key_stats), /undefined/);
+  });
+
+  it('test_readDeepStats_smoke_errors_when_panel_not_open', async () => {
+    installCdpMocks({ evaluate: async () => ({ ok: false, error: 'panel_not_open' }) });
+    const r = await strategy.readDeepStats({});
+    assert.equal(r.success, false);
+    assert.match(r.error, /Strategy Tester panel not open/);
+  });
+
+  // ── R6 — strategy_get_equity_summary ─────────────────────────────
+
+  it('test_getEquitySummary_smoke_legend_values_only', async () => {
+    installCdpMocks({
+      evaluate: async (expr) => (classify(expr) === 'legend'
+        ? { ok: true, deep: true, mode: 'deep',
+          legend: { cumulative_pnl: '-33,961.90 USD', buy_and_hold: '-12,345.00 USD', margin_calls: '3' },
+          source: 'dom' }
+        : readAnswers[classify(expr)]),
+    });
+    const r = await strategy.getEquitySummary({});
+    assert.equal(r.success, true);
+    assert.equal(r.legend.cumulative_pnl, '-33,961.90 USD');
+    assert.equal(r.legend.buy_and_hold, '-12,345.00 USD');
+    assert.equal(r.legend.margin_calls, '3');
+    assert.equal(r.mode, 'deep');
+    // The equity curve series is explicitly out of scope.
+    assert.match(String(r.note), /curve/i);
+  });
+
+  // ── R3 — strategy_get_deep_trades ────────────────────────────────
+
+  it('test_getDeepTrades_smoke_empty_table', async () => {
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const flat = expr.replace(/\s+/g, ' ');
+        if (flat.includes('sc.scrollTop = Math.min')) return true;
+        if (flat.includes('Trade number')) {
+          return { ok: true, deep: true, mode: 'deep', rows: [], empty: true,
+            headers: [], total: null, scroll: null, source: 'dom' };
+        }
+        return readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.getDeepTrades({ max_trades: 25 });
+    assert.equal(r.success, true);
+    assert.equal(r.empty, true);
+    assert.equal(r.trade_count, 0);
+    assert.deepEqual(r.trades, []);
+  });
+
+  it('test_getDeepTrades_smoke_returns_rows_with_headers', async () => {
+    // Rows are arrays indexed to the header columns (the panel's own shape).
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const flat = expr.replace(/\s+/g, ' ');
+        if (flat.includes('sc.scrollTop = Math.min')) return true;
+        if (flat.includes('Trade number')) {
+          return { ok: true, deep: true, mode: 'deep', empty: false,
+            headers: ['Trade number', 'Type', 'Net PnL'],
+            rows: [['1', 'Long', '10.00USD'], ['2', 'Short', '-5.00USD']],
+            scroll: null, total: '2', source: 'dom' };
+        }
+        return readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.getDeepTrades({ max_trades: 25 });
+    assert.equal(r.success, true);
+    assert.equal(r.trades.length, 2);
+    assert.equal(r.trades[0]['Trade number'], '1');
+    assert.equal(r.trades[1]['Net PnL'], '-5.00USD');
+    // Every row must carry the full header set — a shifted column is a bug.
+    for (const h of r.headers) assert.ok(Object.prototype.hasOwnProperty.call(r.trades[0], h));
+  });
+
+  it('test_getDeepTrades_smoke_dedupes_virtualised_rows', async () => {
+    // A virtualised table renders one window at a time: the first scrape sees
+    // rows 1-3 and reports a scrollable container, then each scroll + re-read
+    // widens the window, overlapping on both edges. The collector must de-dupe
+    // so the overlapping rows cannot inflate the collection, and every row
+    // within the cap must be returned exactly once.
+    //
+    // The loop alternates two page-side expressions: the row scrape and a
+    // scroll-step probe (which moves the container and re-renders).
+    const SCRAPE = 'Trade number';
+    const SCROLL_STEP = 'sc.scrollTop = Math.min';
+    const windows = [[1, 2, 3], [3, 4, 5], [5, 6], []];   // last window = empty
+    let scrapeCount = 0;
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const flat = expr.replace(/\s+/g, ' ');
+        if (flat.includes(SCROLL_STEP)) {
+          return true;
+        }
+        if (flat.includes(SCRAPE)) {
+          const nums = windows[Math.min(scrapeCount, windows.length - 1)];
+          scrapeCount++;
+          return { ok: true, deep: true, mode: 'deep', empty: nums.length === 0,
+            headers: ['Trade number', 'Type', 'Net PnL'],
+            rows: nums.map((n) => [String(n), 'Long', '1.00USD']),
+            total: '6', source: 'dom',
+            scroll: { top: 0, height: 12, scrollHeight: 40 } };
+        }
+        return readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.getDeepTrades({ max_trades: 25 });
+    assert.equal(r.success, true);
+    const ids = r.trades.map((t) => t['Trade number']).map(Number).sort((a, b) => a - b);
+    // De-dupe: every collected id appears exactly once.
+    assert.equal(new Set(ids).size, ids.length);
+    // The overlapping windows must not lose or duplicate a trade.
+    assert.deepEqual(ids, [1, 2, 3, 4, 5, 6]);
+    assert.equal(r.trade_count, 6);
+    assert.ok(scrapeCount >= 2, 'expected the scroll loop to re-scrape at least once');
+  });
+
+  // ── R4 — strategy_set_broker_settings ─────────────────────────────
+
+  // The gear/dialog probe and the field-read probe are two distinct
+  // expressions: `var inputs = dlg` opens the dialog, the other enumerates
+  // its inputs.
+  // `var inputs = dlg` opens the dialog; the other dialog expressions are the
+  // per-field value probes (before-write and read-back) and the write probe,
+  // all of which return a bare value string / { ok, value } — NOT an object
+  // with a `fields` key (that is a different call entirely).
+  const gearOrDialogue = (expr, fieldValue) => {
+    const s = expr.replace(/\s+/g, ' ');
+    if (s.includes('var inputs = dlg')) return { ok: true, already_open: true };
+    if (s.includes('querySelectorAll(\'input\')')) return fieldValue;
+    if (s.includes('setter.call(el,')) return { ok: true, value: fieldValue };
+    if (s.includes('querySelectorAll(\'button\')')) return { ok: true, button: 'Ok', clicked: true };
+    return null;
+  };
+
+  it('test_setBrokerSettings_smoke_requires_a_field', async () => {
+    await assert.rejects(() => strategy.setBrokerSettings({}), /pass at least one of/);
+  });
+
+  it('test_setBrokerSettings_smoke_reports_mismatched_readback', async () => {
+    // The write never lands: every value probe returns "0" while "3" was
+    // requested, so the read-back disagrees and the dialog is not committed.
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const s = expr.replace(/\s+/g, ' ');
+        // The write probe does take the value, but the read-back that follows
+        // still reports the old one — the read-only disagreement case.
+        if (s.includes('setter.call(el,')) return { ok: true, value: '0' };
+        return gearOrDialogue(expr, '0') ?? readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setBrokerSettings({ slippage: '3' });
+    assert.equal(r.success, false);
+    assert.equal(r.committed, false);
+    // A read-back that disagrees with the write must be reported, not hidden.
+    assert.equal(r.mismatches.length, 1);
+    assert.equal(r.mismatches[0].field, 'slippage');
+    assert.equal(r.mismatches[0].requested, '3');
+  });
+
+  it('test_setBrokerSettings_smoke_commits_when_readback_matches', async () => {
+    // The write lands on the first try and the read-back agrees, so the Ok
+    // commit path is taken and no mismatch is reported.
+    installCdpMocks({
+      evaluate: async (expr) => gearOrDialogue(expr, '3') ?? readAnswers[classify(expr)],
+      getClient: noopClient,
+    });
+    const r = await strategy.setBrokerSettings({ slippage: '3' });
+    assert.equal(r.success, true);
+    assert.equal(r.committed, true);
   });
 });

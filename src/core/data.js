@@ -463,6 +463,9 @@ export async function getStrategyInfo({ _deps } = {}) {
       } catch (e) {}
       // DOM scrape covers the date range (no clean API surface) and acts as
       // a fallback when the strategy source isn't on the active chart.
+      // TV 3.5.0 removed the [class*="strategyGroup-"] / [class*="dateRangeMenuWrapper-"]
+      // wrappers entirely; the report shell now carries the name and the range label
+      // directly. Verified live: see the [class*="reportShell-"] selector below.
       try {
         if (!name) {
           var nameEl = document.querySelector('[class*="strategyGroup-"] [class*="ellipsisContainer-"]');
@@ -470,6 +473,30 @@ export async function getStrategyInfo({ _deps } = {}) {
         }
         var dateEl = document.querySelector('[class*="dateRangeMenuWrapper-"] [class*="ellipsisContainer-"]');
         if (dateEl) dateRange = dateEl.textContent.trim();
+      } catch (e) {}
+      // Fallback (verified live on TV 3.5.1, 2026-11-28): the range label is a
+      // real button inside the panel — "Jan 1, 2015 — Jun 30, 2016 Deep" /
+      // aria-label "Jan 1, 2015 — Jun 30, 2016". Its parent block also carries
+      // the strategy name as the sibling link. The old
+      // [class*="dateRangeMenuWrapper-"] selector matches nothing on this build.
+      try {
+        var shell = document.querySelector('[class*="reportShell-"]');
+        if (shell) {
+          var shape = new RegExp('\\b(?:19|20)\\d{2}\\b.{0,60}(?:—|-|–|\\bto\\b).{0,60}\\b(?:19|20)\\d{2}\\b');
+          var preset = new RegExp('last\\s+\\d+\\s+days|entire\\s+history', 'i');
+          var trimMode = new RegExp('\\s+(?:Deep|Standard)\\s*$', 'i');
+          var dateBtn = [].slice.call(shell.querySelectorAll('button, [role="button"]')).find(function(b) {
+            if (b.offsetParent === null) return false;
+            var text = (b.textContent || '').trim();
+            var aria = (b.getAttribute('aria-label') || '').trim();
+            return shape.test(text) || shape.test(aria) || preset.test(text);
+          });
+          if (dateBtn && !dateRange) {
+            var raw = dateBtn.getAttribute('aria-label') || dateBtn.textContent || '';
+            // Trim a trailing mode word ("Deep"/"Standard") if the textContent path is used.
+            dateRange = raw.replace(trimMode, '').trim() || null;
+          }
+        }
       } catch (e) {}
       return { name: name, date_range: dateRange, source: source };
     })()

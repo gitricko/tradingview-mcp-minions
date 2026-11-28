@@ -6,9 +6,14 @@ import CDP from 'chrome-remote-interface';
 import { getClient, connectToTarget, getTargetInfo, claimAndPin, releaseAndUnpin, getPin } from '../connection.js';
 import * as registry from './pin_registry.js';
 
+import { getCdpHost, getCdpPort } from '../connection.js';
+
 // See src/connection.js for why IPv4 is the safer default than 'localhost'.
-const CDP_HOST = process.env.TV_CDP_HOST || '127.0.0.1';
-const CDP_PORT = Number(process.env.TV_CDP_PORT) || 9222;
+// Resolved at CALL time via getCdpHost()/getCdpPort() so a late-arriving
+// TV_CDP_HOST / TV_CDP_PORT is honoured without a process restart.
+function cdpTarget(targetId) {
+  return { host: getCdpHost(), port: getCdpPort(), target: targetId };
+}
 
 // Per-target Pine read timeout. A single hung target (e.g., one that's
 // mid-navigation) would otherwise stall the whole `tab list` fan-out.
@@ -38,7 +43,7 @@ async function _readActivePineScript(targetId, cdpFactory = CDP) {
   // hung-target read (the scenario this function exists for) leaked
   // a CDP socket.
   const connectAndRead = (async () => {
-    client = await cdpFactory({ host: CDP_HOST, port: CDP_PORT, target: targetId });
+    client = await cdpFactory(cdpTarget(targetId));
     await client.Runtime.enable();
     const { result } = await client.Runtime.evaluate({
       expression: `
@@ -86,7 +91,7 @@ async function _readActivePineScript(targetId, cdpFactory = CDP) {
  */
 export async function list({ include_pine_script = true, _deps } = {}) {
   const cdpFactory = _deps?.cdpFactory || CDP;
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const resp = await fetch(`http://${getCdpHost()}:${getCdpPort()}/json/list`);
   const targets = await resp.json();
 
   const baseTabs = targets
@@ -131,13 +136,13 @@ export async function list({ include_pine_script = true, _deps } = {}) {
  * @returns {Promise<object>} { success, picker_tab_id, new_target, hint }
  */
 async function _findShellPagesAndTrigger(cdpFactory) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const resp = await fetch(`http://${getCdpHost()}:${getCdpPort()}/json/list`);
   const targets = await resp.json();
   const shells = targets.filter(t => t.type === 'page' && /file:\/\/.*index\.html/i.test(t.url));
   for (const shell of shells) {
     let c;
     try {
-      c = await cdpFactory({ host: CDP_HOST, port: CDP_PORT, target: shell.id });
+      c = await cdpFactory(cdpTarget(shell.id));
       const { result } = await c.Runtime.evaluate({
         expression: `
           (function() {
@@ -172,7 +177,7 @@ export async function newTab({ _deps } = {}) {
   // Snapshot CDP targets so we can identify the newly-opened tab via diff.
   // Include ALL pages (not just chart tabs) because the new tab starts with
   // an empty URL until TV's layout picker loads.
-  const respBefore = await fetchFn(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const respBefore = await fetchFn(`http://${getCdpHost()}:${getCdpPort()}/json/list`);
   const beforeAll = await respBefore.json();
   const beforeIds = new Set(beforeAll.filter(t => t.type === 'page').map(t => t.id));
 
@@ -191,7 +196,7 @@ export async function newTab({ _deps } = {}) {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 300));
-    const respAfter = await fetchFn(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+    const respAfter = await fetchFn(`http://${getCdpHost()}:${getCdpPort()}/json/list`);
     const afterAll = await respAfter.json();
     const fresh = afterAll.filter(t => t.type === 'page' && !beforeIds.has(t.id));
     if (fresh.length > 0) {
@@ -245,7 +250,7 @@ export async function closeTab({ id, _deps } = {}) {
   // Don't close the last chart tab — leaves the user with nothing visible.
   // Picker tabs (empty URL) don't count for this check; closing them is the
   // intended cleanup path.
-  const respAll = await fetchFn(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const respAll = await fetchFn(`http://${getCdpHost()}:${getCdpPort()}/json/list`);
   const all = await respAll.json();
   const chartTabs = all.filter(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url));
   const target = all.find(t => t.id === targetId);
@@ -257,7 +262,7 @@ export async function closeTab({ id, _deps } = {}) {
     throw new Error('Cannot close the last chart tab. Use tv_launch to restart TradingView instead.');
   }
 
-  const closeResp = await fetchFn(`http://${CDP_HOST}:${CDP_PORT}/json/close/${targetId}`);
+  const closeResp = await fetchFn(`http://${getCdpHost()}:${getCdpPort()}/json/close/${targetId}`);
   const closeBody = closeResp && closeResp.text ? await closeResp.text() : '';
   if (closeResp && closeResp.status && closeResp.status >= 400) {
     throw new Error(`CDP close failed (${closeResp.status}): ${closeBody}`);

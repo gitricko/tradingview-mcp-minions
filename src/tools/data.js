@@ -21,12 +21,12 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester', {}, async () => {
+  server.tool('data_get_strategy_results', 'Get strategy performance metrics (net profit, win rate, drawdown, etc.) from the internal _reportData surface — STANDARD backtest only. While a Premium DEEP backtest range is selected, _reportData still holds the standard run and diverges from the panel DOM (deep PnL/trades are not in this data source); use strategy_read_deep_stats for the deep numbers. Read-only.', {}, async () => {
     try { return jsonResult(await core.getStrategyResults()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_trades', 'Get trade list from Strategy Tester', {
+  server.tool('data_get_trades', 'Get individual trade list from the internal _reportData surface — STANDARD backtest only (max_trades caps the read, default 20). For the per-trade table shown in the Strategy Tester panel (deep or standard, virtualised scroll/collect, empty-table case handled) use strategy_get_deep_trades instead; during a DEEP range this tool returns the standard run, not the panel numbers.', {
     max_trades: z.coerce.number().optional().describe('Maximum trades to return'),
   }, async ({ max_trades }) => {
     try { return jsonResult(await core.getTrades({ max_trades })); }
@@ -38,7 +38,7 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_equity', 'Get equity curve data from Strategy Tester', {}, async () => {
+  server.tool('data_get_equity', 'Get equity curve data points from the internal _reportData surface — STANDARD backtest only. During a DEEP backtest the curve data does not match the panel; for the deep panel legend numbers use strategy_get_equity_summary.', {}, async () => {
     try { return jsonResult(await core.getEquity()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });

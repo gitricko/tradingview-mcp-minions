@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { boolish } from './_validation.js';
 import { jsonResult } from './_format.js';
 import * as core from '../core/strategy.js';
 
@@ -12,6 +13,64 @@ export function registerStrategyTools(server) {
     },
     async ({ from, to }) => {
       try { return jsonResult(await core.setDeepBacktestRange({ from, to })); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
+  server.tool(
+    'strategy_read_deep_stats',
+    'Read the Strategy Tester panel\'s key stats, performance-analysis cards and trade count straight off the DOM panel — the only surface that carries Premium Deep Backtest results. While a DEEP range is selected, the internal _reportData still holds the STANDARD backtest, so data_get_strategy_results / data_get_trades / data_get_equity will show different numbers; this tool reports the mode it observed ("deep" or "standard") plus the date range so the two can never be mixed. Guards the brief "undefined" window while a deep run recomputes: if the key-stat cards are mid-refresh it reports recomputing:true instead of returning garbage. Requires the Strategy Tester panel to be open.',
+    {
+      wait: boolish.optional().describe('Poll until the panel holds real values (key-stat cards stop showing undefined) instead of returning a recomputing:true result (default false)'),
+      wait_timeout_ms: z.coerce.number().optional().describe('Max time to poll when wait:true (default 45000)'),
+    },
+    async ({ wait, wait_timeout_ms }) => {
+      try {
+        return jsonResult(await core.readDeepStats({
+          wait,
+          wait_timeout_ms,
+        }));
+      }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
+  server.tool(
+    'strategy_get_equity_summary',
+    'Read the equity chart legend numbers (Cumulative P&L / Buy & hold / Margin calls) from the Strategy Tester panel. The equity CURVE is canvas-rendered and has no readable data surface, so this tool returns only the legend values, never a point series. Reports the mode (deep/standard) it observed. Requires the Strategy Tester panel to be open.',
+    {},
+    async () => {
+      try { return jsonResult(await core.getEquitySummary()); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
+  server.tool(
+    'strategy_get_deep_trades',
+    'Read the per-trade table on the Strategy Tester "List of trades" tab, scrolling and de-duplicating the virtualised rows (only ~12 of N rows are in the DOM at a time). Works in both deep and standard mode and reports which. The empty-table case returns trade_count: 0 with a note, not an error. max_trades caps how many rows are returned (default 500). Requires the Strategy Tester panel to be open.',
+    {
+      max_trades: z.coerce.number().optional().describe('Maximum trades to return (default 500, capped at 5000)'),
+    },
+    async ({ max_trades }) => {
+      try { return jsonResult(await core.getDeepTrades({ max_trades })); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
+  server.tool(
+    'strategy_set_broker_settings',
+    'Drive the Strategy Tester Settings dialog: write initial_capital / order_size / pyramiding / commission / long_leverage / short_leverage / slippage, read each field back to confirm it took, then commit with Ok. Pass only the fields you want to change. If a field does not take (leverage needs "1x"-shaped values; commission unit is a separate dropdown), the dialog is left open and mismatches are reported. Requires the Strategy Tester panel to be open.',
+    {
+      initial_capital: z.string().optional().describe('Initial capital, e.g. "100000"'),
+      order_size: z.string().optional().describe('Default order size as a percentage of equity, e.g. "100"'),
+      pyramiding: z.string().optional().describe('Pyramiding (number of positions that may be added), e.g. "1"'),
+      commission: z.string().optional().describe('Commission value (unit is a separate dropdown), e.g. "0"'),
+      long_leverage: z.string().optional().describe('Long leverage in "Nx" form, e.g. "1x"'),
+      short_leverage: z.string().optional().describe('Short leverage in "Nx" form, e.g. "1x"'),
+      slippage: z.string().optional().describe('Slippage in ticks, e.g. "0"'),
+    },
+    async (args) => {
+      try { return jsonResult(await core.setBrokerSettings(args)); }
       catch (err) { return jsonResult({ success: false, error: err.message }, true); }
     }
   );

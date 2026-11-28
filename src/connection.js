@@ -8,8 +8,45 @@ let targetInfo = null;
 // 0.0.0.0 (IPv4). The resulting ETIMEDOUT or ECONNREFUSED looks like a
 // missing port even though Chrome is running. Explicit IPv4 avoids it.
 // Override with TV_CDP_HOST when targeting a remote / container CDP.
-const CDP_HOST = process.env.TV_CDP_HOST || '127.0.0.1';
-const CDP_PORT = Number(process.env.TV_CDP_PORT) || 9222;
+//
+// Resolved at CALL time (getCdpHost/getCdpPort), NOT captured at module
+// load: a long-lived MCP server process can be handed its TV_CDP_HOST /
+// TV_CDP_PORT environment later (systemd, docker-compose `environment:`
+// injected after spawn, an operator editing the wrapper script, or a
+// `.env` file read by an outer launcher), and a module-load snapshot would
+// keep dialing the default localhost:9222 forever. The constant exports
+// below are kept as frozen defaults for callers that only need the
+// default — every live path reads the getter.
+const DEFAULT_CDP_HOST = process.env.TV_CDP_HOST || '127.0.0.1';
+const DEFAULT_CDP_PORT = Number(process.env.TV_CDP_PORT) || 9222;
+
+/**
+ * CDP host the client should dial right now. Re-reads process.env on every
+ * call so late-arriving environment configuration is honoured without a
+ * process restart.
+ */
+export function getCdpHost() {
+  return process.env.TV_CDP_HOST || DEFAULT_CDP_HOST;
+}
+
+/**
+ * CDP port the client should dial right now.
+ *
+ * NOTE: the port fallback intentionally chains through
+ * getCdpHost() rather than DEFAULT_CDP_PORT — a process that captured
+ * 9222 from the environment at load time and is then re-pointed at a
+ * remote host must still talk to the remote port.
+ */
+export function getCdpPort() {
+  const raw = process.env.TV_CDP_PORT;
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_CDP_PORT;
+}
+
+// Deprecated: the load-time snapshot. Retained because tests and CLI code
+// read it as a literal, but production dialing goes through getCdpHost().
+const CDP_HOST = DEFAULT_CDP_HOST;
+const CDP_PORT = DEFAULT_CDP_PORT;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
 
@@ -165,7 +202,7 @@ async function _doConnect() {
         throw new Error('No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      client = await CDP({ host: getCdpHost(), port: getCdpPort(), target: target.id });
 
       // Deliberately NOT calling Runtime.enable / Page.enable / DOM.enable.
       //
@@ -204,7 +241,10 @@ async function _doConnect() {
       await new Promise(r => setTimeout(r, delay));
     }
   }
-  throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  throw new Error(
+    `CDP connection failed after ${MAX_RETRIES} attempts to http://${getCdpHost()}:${getCdpPort()}`
+    + ` (TV_CDP_HOST=${getCdpHost()}, TV_CDP_PORT=${getCdpPort()}): ${lastError?.message}`
+    + ` — last cause: ${lastError?.cause?.message || lastError?.cause?.code || 'none reported'}`,);
 }
 
 // ── Tab pinning (per-process) + startup filter (env-driven) ─────────────
@@ -297,7 +337,7 @@ function ensureRegistryExitHandler() {
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const resp = await fetch(`http://${getCdpHost()}:${getCdpPort()}/json/list`);
   const targets = await resp.json();
   const pages = targets.filter(t => t.type === 'page');
 
@@ -464,7 +504,7 @@ export async function connectToTarget(targetId) {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId });
+      client = await CDP({ host: getCdpHost(), port: getCdpPort(), target: targetId });
       // No domain enables — see connect() for the EPIPE-on-TV-close rationale.
       client.on('disconnect', () => { client = null; targetInfo = null; });
       // Re-apply per-target focus emulation. See connect() for rationale.
@@ -477,7 +517,10 @@ export async function connectToTarget(targetId) {
       await new Promise(r => setTimeout(r, delay));
     }
   }
-  throw new Error(`CDP connect to target ${targetId} failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  throw new Error(
+    `CDP connect to target ${targetId} failed after ${MAX_RETRIES} attempts to http://${getCdpHost()}:${getCdpPort()}`
+    + ` (TV_CDP_HOST=${getCdpHost()}, TV_CDP_PORT=${getCdpPort()}): ${lastError?.message}`
+    + ` — last cause: ${lastError?.cause?.message || lastError?.cause?.code || 'none reported'}`,);
 }
 
 // --- Direct API path helpers ---

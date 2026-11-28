@@ -37,6 +37,7 @@ import * as coreReplay from '../src/core/replay.js';
 import * as coreHealth from '../src/core/health.js';
 import * as coreAlerts from '../src/core/alerts.js';
 import * as coreData from '../src/core/data.js';
+import * as strategy from '../src/core/strategy.js';
 import * as corePane from '../src/core/pane.js';
 import * as coreChart from '../src/core/chart.js';
 import * as coreDrawing from '../src/core/drawing.js';
@@ -701,6 +702,68 @@ describe('TradingView MCP — Full E2E', () => {
       assert.equal(r.success, true, 'equity contract success');
       assert.ok(typeof r.data_points === 'number', 'data_points is numeric');
       assert.ok(Array.isArray(r.data), 'data is an array');
+      try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'close' }); } catch {}
+    });
+
+    // ── Deep-backtest surface (panel DOM, not _reportData) ────────────
+    // These read the PANEL, the only surface that carries Premium Deep
+    // Backtesting numbers, and each must tag the mode it observed so a deep
+    // read can never be mixed with data_get_*'s standard _reportData.
+    // LIVE-APP ONLY: the suite's `before` hook exits 1 when CDP is
+    // unreachable, so these never masquerade as passes without an app.
+
+    it('strategy_read_deep_stats — mode-tagged panel stats', async () => {
+      try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'open' }); } catch {}
+      await sleep(500);
+      const r = await strategy.readDeepStats({});
+      assert.ok('success' in r, 'deep stats contract has success');
+      if (r.success) {
+        assert.ok(r.mode === 'deep' || r.mode === 'standard', `mode is deep|standard, got ${r.mode}`);
+        assert.equal(r.source, 'dom', 'the deep read is DOM-scraped, not _reportData');
+        assert.ok(r.key_stats && typeof r.key_stats === 'object', 'key_stats is an object');
+        // A mid-recompute panel must never leak the literal "undefined".
+        assert.doesNotMatch(JSON.stringify(r.key_stats), /"undefined"/);
+      } else {
+        // Panel closed / no strategy: a clear error, never a stale number.
+        assert.ok(typeof r.error === 'string' && r.error.length > 0, 'a failed read explains why');
+      }
+      try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'close' }); } catch {}
+    });
+
+    it('strategy_get_deep_trades — virtualised trade table', async () => {
+      try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'open' }); } catch {}
+      await sleep(500);
+      const r = await strategy.getDeepTrades({ max_trades: 25 });
+      assert.ok('success' in r, 'deep trades contract has success');
+      if (r.success) {
+        assert.ok(Array.isArray(r.trades), 'trades is an array');
+        assert.ok(r.mode === 'deep' || r.mode === 'standard', `mode is deep|standard, got ${r.mode}`);
+        // An empty table is a valid answer, not an error.
+        assert.ok(r.empty === true || r.trades.length > 0, 'either empty:true or rows');
+        for (const t of r.trades) {
+          assert.ok(Object.prototype.hasOwnProperty.call(t, 'Trade_number'), 'every row carries its trade number');
+        }
+      } else {
+        assert.ok(typeof r.error === 'string' && r.error.length > 0, 'a failed read explains why');
+      }
+      try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'close' }); } catch {}
+    });
+
+    it('strategy_get_equity_summary — legend numbers only', async () => {
+      try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'open' }); } catch {}
+      await sleep(500);
+      const r = await strategy.getEquitySummary({});
+      assert.ok('success' in r, 'equity summary contract has success');
+      if (r.success) {
+        // Legend only — the curve series is canvas-rendered and out of scope.
+        assert.ok(r.legend && typeof r.legend === 'object', 'legend is an object');
+        for (const k of ['cumulative_pnl', 'buy_and_hold', 'margin_calls']) {
+          assert.ok(k in r.legend, `legend carries ${k}`);
+        }
+        assert.ok(!Array.isArray(r.data), 'never returns a curve point series');
+      } else {
+        assert.ok(typeof r.error === 'string' && r.error.length > 0, 'a failed read explains why');
+      }
       try { await coreUi.openPanel({ panel: 'strategy-tester', action: 'close' }); } catch {}
     });
 
