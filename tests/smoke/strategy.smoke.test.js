@@ -286,4 +286,59 @@ describe('core/strategy.js — deep reads (smoke)', () => {
     assert.ok(scrapeCount >= 2, 'expected the scroll loop to re-scrape at least once');
   });
 
+  // ── R4 — strategy_set_broker_settings ─────────────────────────────
+
+  // The gear/dialog probe and the field-read probe are two distinct
+  // expressions: `var inputs = dlg` opens the dialog, the other enumerates
+  // its inputs.
+  // `var inputs = dlg` opens the dialog; the other dialog expressions are the
+  // per-field value probes (before-write and read-back) and the write probe,
+  // all of which return a bare value string / { ok, value } — NOT an object
+  // with a `fields` key (that is a different call entirely).
+  const gearOrDialogue = (expr, fieldValue) => {
+    const s = expr.replace(/\s+/g, ' ');
+    if (s.includes('var inputs = dlg')) return { ok: true, already_open: true };
+    if (s.includes('querySelectorAll(\'input\')')) return fieldValue;
+    if (s.includes('setter.call(el,')) return { ok: true, value: fieldValue };
+    if (s.includes('querySelectorAll(\'button\')')) return { ok: true, button: 'Ok', clicked: true };
+    return null;
+  };
+
+  it('test_setBrokerSettings_smoke_requires_a_field', async () => {
+    await assert.rejects(() => strategy.setBrokerSettings({}), /pass at least one of/);
+  });
+
+  it('test_setBrokerSettings_smoke_reports_mismatched_readback', async () => {
+    // The write never lands: every value probe returns "0" while "3" was
+    // requested, so the read-back disagrees and the dialog is not committed.
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const s = expr.replace(/\s+/g, ' ');
+        // The write probe does take the value, but the read-back that follows
+        // still reports the old one — the read-only disagreement case.
+        if (s.includes('setter.call(el,')) return { ok: true, value: '0' };
+        return gearOrDialogue(expr, '0') ?? readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setBrokerSettings({ slippage: '3' });
+    assert.equal(r.success, false);
+    assert.equal(r.committed, false);
+    // A read-back that disagrees with the write must be reported, not hidden.
+    assert.equal(r.mismatches.length, 1);
+    assert.equal(r.mismatches[0].field, 'slippage');
+    assert.equal(r.mismatches[0].requested, '3');
+  });
+
+  it('test_setBrokerSettings_smoke_commits_when_readback_matches', async () => {
+    // The write lands on the first try and the read-back agrees, so the Ok
+    // commit path is taken and no mismatch is reported.
+    installCdpMocks({
+      evaluate: async (expr) => gearOrDialogue(expr, '3') ?? readAnswers[classify(expr)],
+      getClient: noopClient,
+    });
+    const r = await strategy.setBrokerSettings({ slippage: '3' });
+    assert.equal(r.success, true);
+    assert.equal(r.committed, true);
+  });
 });

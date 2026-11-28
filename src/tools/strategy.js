@@ -56,4 +56,22 @@ export function registerStrategyTools(server) {
       catch (err) { return jsonResult({ success: false, error: err.message }, true); }
     }
   );
+
+  server.tool(
+    'strategy_set_broker_settings',
+    'Drive the Strategy Tester Settings dialog: write initial_capital / order_size / pyramiding / commission / long_leverage / short_leverage / slippage, read each field back to confirm it took, then commit with Ok. Pass only the fields you want to change. If a field does not take (leverage needs "1x"-shaped values; commission unit is a separate dropdown), the dialog is left open and mismatches are reported. Requires the Strategy Tester panel to be open.',
+    {
+      initial_capital: z.string().optional().describe('Initial capital, e.g. "100000"'),
+      order_size: z.string().optional().describe('Default order size as a percentage of equity, e.g. "100"'),
+      pyramiding: z.string().optional().describe('Pyramiding (number of positions that may be added), e.g. "1"'),
+      commission: z.string().optional().describe('Commission value (unit is a separate dropdown), e.g. "0"'),
+      long_leverage: z.string().optional().describe('Long leverage in "Nx" form, e.g. "1x"'),
+      short_leverage: z.string().optional().describe('Short leverage in "Nx" form, e.g. "1x"'),
+      slippage: z.string().optional().describe('Slippage in ticks, e.g. "0"'),
+    },
+    async (args) => {
+      try { return jsonResult(await core.setBrokerSettings(args)); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
 }

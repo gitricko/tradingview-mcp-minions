@@ -871,3 +871,231 @@ export async function getDeepTrades({ max_trades = 500, _deps } = {}) {
       : undefined,
   };
 }
+
+// ---------------------------------------------------------------------------
+// R4 — strategy_set_broker_settings (Settings gear → 7 inputs → Ok → read-back)
+// ---------------------------------------------------------------------------
+
+/**
+ * Broker-emulator settings fields, in the deterministic on-screen order the
+ * Settings dialog exposes them (verified live against TV 3.5.1 — the labels
+ * are NOT in each input's ancestor chain, so the mapping is positional):
+ *
+ *   0 initial_capital   (USD)
+ *   1 order_size        (% of equity or contracts)
+ *   2 pyramiding        (number)
+ *   3 commission        (value; unit is a separate dropdown: Percent/Contract)
+ *   4 long_leverage     ("1x" style)
+ *   5 short_leverage    ("1x" style)
+ *   6 slippage          (ticks)
+ *
+ * The tool opens the gear, writes the requested fields via the React-friendly
+ * value setter (each in its own evaluate — a single multi-write is
+ * clobbered by React's re-render), reads every field back, then commits
+ * with Ok. Values that did not take are reported in `mismatches` and the
+ * call returns success:false (the dialog is left open so it can be fixed).
+ */
+const BROKER_FIELDS = [
+  'initial_capital',
+  'order_size',
+  'pyramiding',
+  'commission',
+  'long_leverage',
+  'short_leverage',
+  'slippage',
+];
+
+export async function setBrokerSettings({ initial_capital, order_size, pyramiding, commission, long_leverage, short_leverage, slippage, _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
+
+  // Normalise the requested writes.
+  const requested = {};
+  for (const f of BROKER_FIELDS) {
+    const v = { initial_capital, order_size, pyramiding, commission, long_leverage, short_leverage, slippage }[f];
+    if (v !== undefined) requested[f] = String(v).trim();
+  }
+  const requestedKeys = Object.keys(requested);
+  if (requestedKeys.length === 0) {
+    throw new Error('setBrokerSettings: pass at least one of initial_capital, order_size, pyramiding, commission, long_leverage, short_leverage, slippage.');
+  }
+
+  const fieldIndex = {};
+  BROKER_FIELDS.forEach((f, i) => { fieldIndex[f] = i; });
+  const writes = requestedKeys.map((f) => ({ field: f, index: fieldIndex[f], value: requested[f] }));
+
+  // Step 1 — open the Settings gear (a real mouse event; a stray .click()
+  // in the panel can collapse the Strategy Tester).
+  const gear = await evaluate(`
+    (function() {
+      try {
+        var shell = document.querySelector('[class*="reportShell-" i]');
+        if (!shell) return { ok: false, error: 'panel_not_open' };
+        // If a settings dialog is already open (previous call left it there),
+        // reuse it — no need to re-open.
+        var dlg = document.querySelector('[role="dialog"], [data-dialog-name]');
+        var inputs = dlg ? [].slice.call(dlg.querySelectorAll('input')) : [];
+        if (inputs.some(function (i) { return i.offsetParent !== null && i.getBoundingClientRect().width > 0; })) {
+          return { ok: true, already_open: true };
+        }
+        var btns = [].slice.call(shell.querySelectorAll('button, [role="button"]'));
+        var gearBtn = btns.find(function (b) {
+          return b.offsetParent !== null && (b.getAttribute('aria-label') || '') === 'Settings';
+        });
+        if (!gearBtn) return { ok: false, error: 'Settings button not found in the Strategy Tester header' };
+        var r = gearBtn.getBoundingClientRect();
+        return {
+          ok: true,
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          dpr: window.devicePixelRatio || 1,
+        };
+      } catch (e) {
+        return { ok: false, error: 'page-side: ' + String(e && e.message || e) };
+      }
+    })()
+  `);
+  if (!gear || gear.ok !== true) {
+    const err = gear?.error === 'panel_not_open'
+      ? 'Strategy Tester panel not open — open it before changing broker settings.'
+      : (gear?.error || 'could not open the Settings dialog');
+    return { success: false, error: err, source: 'dom' };
+  }
+  if (!gear.already_open) {
+    const { getClient } = _resolve(_deps);
+    const client = await getClient();
+    const dx = Math.round(gear.x * gear.dpr);
+    const dy = Math.round(gear.y * gear.dpr);
+    await client.Input.dispatchMouseEvent({ type: 'mouseMoved', x: dx, y: dy });
+    await client.Input.dispatchMouseEvent({ type: 'mousePressed', x: dx, y: dy, button: 'left', buttons: 1, clickCount: 1 });
+    await client.Input.dispatchMouseEvent({ type: 'mouseReleased', x: dx, y: dy, button: 'left' });
+  }
+
+  // Step 2 — wait for the dialog's inputs to mount.
+  let dialogReady = false;
+  for (let i = 0; i < 20; i++) {
+    dialogReady = await evaluate(`
+      (function() {
+        var dlg = document.querySelector('[role="dialog"], [data-dialog-name]');
+        if (!dlg) return 0;
+        var n = 0;
+        for (var i = 0; i < dlg.querySelectorAll('input').length; i++) {
+          var el = dlg.querySelectorAll('input')[i];
+          if (el.offsetParent !== null && el.getBoundingClientRect().width > 0) n++;
+        }
+        return n;
+      })()
+    `);
+    if (Number(dialogReady) >= 7) { dialogReady = true; break; }
+    await new Promise(r => setTimeout(r, 250));
+  }
+  if (!dialogReady) {
+    return {
+      success: false,
+      error: 'Settings dialog did not expose its inputs (expected 7 visible fields)',
+      source: 'dom',
+    };
+  }
+
+  // Step 3 — write each requested field. One evaluate per field: React's
+  // re-render clobbers a multi-field write that lands in the same tick.
+  const before = {};
+  const writeProbes = [];
+  for (const w of writes) {
+    const beforeVal = await evaluate(`
+      (function() {
+        var dlg = document.querySelector('[role="dialog"], [data-dialog-name]');
+        if (!dlg) return null;
+        var vis = [].slice.call(dlg.querySelectorAll('input')).filter(function (i) {
+          return i.offsetParent !== null && i.getBoundingClientRect().width > 0;
+        });
+        return vis[${w.index}] ? vis[${w.index}].value : null;
+      })()
+    `);
+    before[w.field] = beforeVal;
+
+    const escVal = JSON.stringify(w.value);
+    const wRes = await evaluate(`
+      (function() {
+        var dlg = document.querySelector('[role="dialog"], [data-dialog-name]');
+        if (!dlg) return { ok: false, error: 'dialog closed mid-write' };
+        var vis = [].slice.call(dlg.querySelectorAll('input')).filter(function (i) {
+          return i.offsetParent !== null && i.getBoundingClientRect().width > 0;
+        });
+        var el = vis[${w.index}];
+        if (!el) return { ok: false, error: 'input ' + ${w.index} + ' not visible' };
+        // React-friendly value set: bypass the native setter so React's
+        // onChange handler actually fires.
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, ${escVal});
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, value: el.value };
+      })()
+    `);
+    writeProbes.push({ field: w.field, result: wRes });
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  // Step 4 — read every requested field back to confirm it took.
+  const readbacks = {};
+  for (const w of writes) {
+    readbacks[w.field] = await evaluate(`
+      (function() {
+        var dlg = document.querySelector('[role="dialog"], [data-dialog-name]');
+        if (!dlg) return null;
+        var vis = [].slice.call(dlg.querySelectorAll('input')).filter(function (i) {
+          return i.offsetParent !== null && i.getBoundingClientRect().width > 0;
+        });
+        return vis[${w.index}] ? vis[${w.index}].value : null;
+      })()
+    `);
+  }
+
+  const mismatches = writes
+    .filter((w) => String(readbacks[w.field] ?? '').replace(/[^0-9A-Za-z.]/g, '').toLowerCase() !== String(w.value).replace(/[^0-9A-Za-z.]/g, '').toLowerCase())
+    .map((w) => ({ field: w.field, requested: w.value, read_back: readbacks[w.field] }));
+
+  // Step 5 — commit with Ok only when everything took.
+  let committed = false;
+  if (mismatches.length === 0) {
+    const commitRes = await evaluate(`
+      (function() {
+        var dlg = document.querySelector('[role="dialog"], [data-dialog-name]');
+        if (!dlg) return { ok: false, error: 'dialog closed before commit' };
+        var btns = [].slice.call(dlg.querySelectorAll('button'));
+        var submit = btns.find(function (b) {
+          var t = (b.textContent || '').trim();
+          return /^(Ok|OK|D\u2019accord|Accepter|Appliquer|Apply|Apply)$/i.test(t) && b.offsetParent !== null;
+        });
+        if (!submit) return { ok: false, error: 'commit button (Ok) not found in the dialog' };
+        submit.click();
+        return { ok: true };
+      })()
+    `);
+    if (!commitRes || commitRes.ok !== true) {
+      return {
+        success: false,
+        error: commitRes?.error || 'could not commit the Settings dialog',
+        readbacks,
+        mismatches: [],
+        before,
+        source: 'dom',
+      };
+    }
+    await new Promise(r => setTimeout(r, 500));
+    committed = true;
+  }
+
+  return {
+    success: mismatches.length === 0,
+    committed,
+    applied: committed ? readbacks : null,
+    readbacks,
+    before,
+    mismatches,
+    note: mismatches.length
+      ? 'some fields did not take (leverage fields may need a "1x"-shaped value; commission unit is a separate dropdown). The dialog was left open — fix the values and commit manually, or retry with corrected input.'
+      : undefined,
+    source: 'dom',
+  };
+}
