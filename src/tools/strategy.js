@@ -34,4 +34,14 @@ export function registerStrategyTools(server) {
       catch (err) { return jsonResult({ success: false, error: err.message }, true); }
     }
   );
+
+  server.tool(
+    'strategy_get_equity_summary',
+    'Read the equity chart legend numbers (Cumulative P&L / Buy & hold / Margin calls) from the Strategy Tester panel. The equity CURVE is canvas-rendered and has no readable data surface, so this tool returns only the legend values, never a point series. Reports the mode (deep/standard) it observed. Requires the Strategy Tester panel to be open.',
+    {},
+    async () => {
+      try { return jsonResult(await core.getEquitySummary()); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
 }

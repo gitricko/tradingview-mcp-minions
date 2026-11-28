@@ -537,3 +537,85 @@ export async function readDeepStats({ wait = false, wait_timeout_ms = 45000, wai
   };
 }
 
+// ---------------------------------------------------------------------------
+// R6 — strategy_get_equity_summary (legend numbers only — NOT the curve)
+// ---------------------------------------------------------------------------
+
+/**
+ * The equity chart is canvas-rendered, so the POINT SERIES is not exposed
+ * anywhere (no `_reportData.equity`/`curve`, no data-bearing SVG paths, no
+ * `window.LightweightCharts`). Only the canvas LEGEND carries DOM text:
+ * Cumulative P&L, Buy & hold, Margin calls. This exposes exactly those
+ * numbers and says so — it is deliberately NOT an equity curve read.
+ */
+export async function getEquitySummary({ _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
+  const result = await evaluate(`
+    (function() {
+      try {
+        ${CLEAN_SRC}
+        var shell = document.querySelector('[class*="reportShell-" i]');
+        if (!shell) return { ok: false, error: 'panel_not_open' };
+        var text = (shell.innerText || '');
+        var deep = /(^|\\s)DEEP(\\s|$)/.test(text);
+
+        // The equity chart is canvas-rendered: no data-bearing SVG paths, no
+        // _reportData.equity/curve, no LightweightCharts. The only DOM text is
+        // the chart legend. Each legend row is [class*="legendRow-"]: the
+        // label is the row's [class*="title-"] leaf and the value is the
+        // row's next text-bearing content after that label. "Margin calls"
+        // carries no value when there are zero.
+        var out = { cumulative_pnl: null, buy_and_hold: null, margin_calls: null };
+        var rows = shell.querySelectorAll('[class*="legendRow-" i]');
+        for (var r = 0; r < rows.length; r++) {
+          var row = rows[r];
+          if (row.offsetParent === null) continue;
+          var labelEl = row.querySelector('[class*="title-" i]');
+          var L = __clean(labelEl ? labelEl.textContent : null);
+          if (!L || L.length > 40) continue;
+          L = L.replace(/:$/, '');
+          var key = null;
+          if (L === 'Cumulative PnL' || L === 'Cumulative P&L' || L === 'Cumulative profit') key = 'cumulative_pnl';
+          else if (L === 'Buy and hold' || L === 'Buy & hold' || L === 'Buy-and-hold') key = 'buy_and_hold';
+          else if (L === 'Margin calls') key = 'margin_calls';
+          if (!key) continue;
+          // Value: walk the label's siblings for the first value-bearing node.
+          var val = null;
+          var node = labelEl ? labelEl.nextSibling : null;
+          for (var d = 0; d < 6 && node; d++) {
+            var t2 = __clean(node.textContent);
+            if (t2 && t2 !== L) { val = t2; break; }
+            node = node.nextSibling;
+          }
+          if (val === null) {
+            // No sibling value: derive from the row text after the label.
+            var rowText = __clean(row.innerText) || '';
+            var after = rowText.slice(L.length).replace(/^[\\s|]+/, '').trim();
+            val = (after === '' || after === L) ? null : after;
+          }
+          out[key] = val;
+        }
+
+        return { ok: true, deep: deep, mode: deep ? 'deep' : 'standard', legend: out, source: 'dom' };
+      } catch (e) {
+        return { ok: false, error: 'page-side: ' + String(e && e.message || e) };
+      }
+    })()
+  `);
+  if (!result || result.ok !== true) {
+    const err = result?.error === 'panel_not_open'
+      ? 'Strategy Tester panel not open — open it before reading the equity legend.'
+      : (result?.error || 'equity legend did not respond');
+    return {
+      success: false,
+      error: err,
+      note: 'The equity CURVE is canvas-rendered and is deliberately not read here — this tool returns only the legend numbers (Cumulative P&L / Buy & hold / Margin calls).',
+      source: 'dom',
+    };
+  }
+  return {
+    success: true,
+    ...result,
+    note: 'Legend values only — the equity curve series is canvas-rendered and out of scope for this tool.',
+  };
+}

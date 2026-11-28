@@ -176,4 +176,24 @@ describe('core/strategy.js — deep reads (smoke)', () => {
     assert.match(r.error, /Strategy Tester panel not open/);
   });
 
+  // ── R6 — strategy_get_equity_summary ─────────────────────────────
+
+  it('test_getEquitySummary_smoke_legend_values_only', async () => {
+    installCdpMocks({
+      evaluate: async (expr) => (classify(expr) === 'legend'
+        ? { ok: true, deep: true, mode: 'deep',
+          legend: { cumulative_pnl: '-33,961.90 USD', buy_and_hold: '-12,345.00 USD', margin_calls: '3' },
+          source: 'dom' }
+        : readAnswers[classify(expr)]),
+    });
+    const r = await strategy.getEquitySummary({});
+    assert.equal(r.success, true);
+    assert.equal(r.legend.cumulative_pnl, '-33,961.90 USD');
+    assert.equal(r.legend.buy_and_hold, '-12,345.00 USD');
+    assert.equal(r.legend.margin_calls, '3');
+    assert.equal(r.mode, 'deep');
+    // The equity curve series is explicitly out of scope.
+    assert.match(String(r.note), /curve/i);
+  });
+
 });
