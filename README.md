@@ -217,7 +217,7 @@ tv replay start/step/stop/status/autoplay/trade/set-resolution
 tv stream quote/bars/values/lines/labels/tables/all
 tv ui click/keyboard/hover/scroll/find/type/panel/fullscreen/mouse/dismiss/dialogs
 tv hotlist / screener / news / snapshot
-tv strategy set-deep-bt-range
+tv strategy set-deep-bt-range/deep-stats/deep-trades/equity-summary/broker-settings
 tv screenshot / discover / ui-state / range / scroll
 ```
 
@@ -289,13 +289,25 @@ Read `line.new()`, `label.new()`, `table.new()`, `box.new()`, `plotshape()` outp
 
 Read backtest results from a Pine Script strategy on the chart. The Strategy Tester panel must be open (use `ui_open_panel`).
 
+**Two surfaces, two jobs.** The `data_get_*` tools read the chart model's internal
+backtest data (`_reportData`) — that surface describes the **standard** backtest and
+keeps describing the standard backtest while a Premium **Deep Backtest** range is
+selected, so mid-deep-run they disagree with what the Strategy Tester panel draws.
+The `strategy_*` tools scrape the **panel DOM** and tag which mode they observed
+(`mode: "deep"` / `"standard"`). Use `strategy_*` for any deep-backtest question and
+`data_get_*` for quick standard-run reads.
+
 | Tool | What it reads |
 |------|---------------|
-| `data_get_strategy_results` | Strategy performance metrics (net profit, win rate, drawdown, etc.) |
+| `data_get_strategy_results` | Strategy performance metrics (net profit, win rate, drawdown, etc.) — **standard backtest only**; for a deep range use `strategy_read_deep_stats` |
 | `data_get_strategy_info` | Active strategy name + Strategy Tester date range — sanity-check before reading metrics |
-| `data_get_trades` | Individual trade list with entry/exit, P&L per trade |
-| `data_get_equity` | Equity curve data points |
+| `data_get_trades` | Individual trade list with entry/exit, P&L per trade — **standard only** (capped); deep panel trades → `strategy_get_deep_trades` |
+| `data_get_equity` | Equity curve data points — **standard only**; deep panel figure → `strategy_get_equity_summary` |
 | `strategy_set_deep_bt_range` | Set the Deep Backtesting date range via the Strategy Tester calendar picker |
+| `strategy_read_deep_stats` | Deep/standard performance stats (profit, drawdown, profit factor, win%, trade count) read from the panel DOM, with the observed mode and date range |
+| `strategy_get_deep_trades` | Individual trade list from the panel's List of trades tab (deep or standard, virtualised scroll/collect) |
+| `strategy_get_equity_summary` | Equity-chart legend numbers (cumulative P&L, buy & hold, margin calls) — legend only, the curve points are canvas-rendered |
+| `strategy_set_broker_settings` | Write Strategy Tester broker settings (initial capital, order size, pyramiding, commission, leverage, slippage) with read-back confirmation |
 
 ### News & Signals
 

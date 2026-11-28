@@ -291,3 +291,53 @@ describe('CLI — morning brief (integration)', () => {
     assert.ok(stdout.includes('save'));
   });
 });
+
+describe('CLI — strategy subcommands', () => {
+  // Every strategy deep-surface subcommand must be routable, and each must
+  // fail with the standard connection envelope (exit 2) against a dead CDP
+  // endpoint rather than a routing error — a botched registration surfaces
+  // as `Unknown subcommand` before any probe is attempted.
+  const DEAD = { env: { ...process.env, TV_CDP_HOST: '127.0.0.1', TV_CDP_PORT: '9999' } };
+
+  it('strategy --help lists every deep-surface subcommand', () => {
+    const { stdout, exitCode } = run(['strategy', '--help']);
+    assert.equal(exitCode, 0);
+    for (const sub of ['deep-stats', 'deep-trades', 'equity-summary', 'broker-settings', 'set-deep-bt-range']) {
+      assert.ok(stdout.includes(sub), `expected ${sub} in the strategy help`);
+    }
+  });
+
+  it('strategy deep-stats reaches the CDP probe (routing, not a bad subcommand)', () => {
+    const { stderr, exitCode } = run(['strategy', 'deep-stats'], { ...DEAD, timeout: 30000 });
+    assert.equal(exitCode, 2, 'an unreachable CDP endpoint must exit 2');
+    assert.match(stderr, /CDP connection failed/);
+  });
+
+  it('strategy deep-trades reaches the CDP probe', () => {
+    const { stderr, exitCode } = run(['strategy', 'deep-trades'], { ...DEAD, timeout: 30000 });
+    assert.equal(exitCode, 2);
+    assert.match(stderr, /CDP connection failed/);
+  });
+
+  it('strategy set-deep-bt-range still validates its positional args offline', () => {
+    // Argument-shape validation happens before the probe, so it fails fast
+    // with the usage message and no connection attempt.
+    const { stderr, exitCode } = run(['strategy', 'set-deep-bt-range', '2024-01-01'], DEAD);
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /Usage: tv strategy set-deep-bt-range/);
+  });
+
+  it('strategy broker-settings requires at least one field', () => {
+    const { stderr, exitCode } = run(['strategy', 'broker-settings'], DEAD);
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /pass at least one of/);
+  });
+
+  it('strategy broker-settings --help maps kebab flags to core field names', () => {
+    const { stdout, exitCode } = run(['strategy', 'broker-settings', '--help']);
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /--initial-capital/);
+    assert.match(stdout, /--long-leverage/);
+    assert.match(stdout, /--slippage/);
+  });
+});
