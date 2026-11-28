@@ -44,4 +44,16 @@ export function registerStrategyTools(server) {
       catch (err) { return jsonResult({ success: false, error: err.message }, true); }
     }
   );
+
+  server.tool(
+    'strategy_get_deep_trades',
+    'Read the per-trade table on the Strategy Tester "List of trades" tab, scrolling and de-duplicating the virtualised rows (only ~12 of N rows are in the DOM at a time). Works in both deep and standard mode and reports which. The empty-table case returns trade_count: 0 with a note, not an error. max_trades caps how many rows are returned (default 500). Requires the Strategy Tester panel to be open.',
+    {
+      max_trades: z.coerce.number().optional().describe('Maximum trades to return (default 500, capped at 5000)'),
+    },
+    async ({ max_trades }) => {
+      try { return jsonResult(await core.getDeepTrades({ max_trades })); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
 }

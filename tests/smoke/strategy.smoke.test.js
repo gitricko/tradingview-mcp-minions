@@ -196,4 +196,94 @@ describe('core/strategy.js — deep reads (smoke)', () => {
     assert.match(String(r.note), /curve/i);
   });
 
+  // ── R3 — strategy_get_deep_trades ────────────────────────────────
+
+  it('test_getDeepTrades_smoke_empty_table', async () => {
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const flat = expr.replace(/\s+/g, ' ');
+        if (flat.includes('sc.scrollTop = Math.min')) return true;
+        if (flat.includes('Trade number')) {
+          return { ok: true, deep: true, mode: 'deep', rows: [], empty: true,
+            headers: [], total: null, scroll: null, source: 'dom' };
+        }
+        return readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.getDeepTrades({ max_trades: 25 });
+    assert.equal(r.success, true);
+    assert.equal(r.empty, true);
+    assert.equal(r.trade_count, 0);
+    assert.deepEqual(r.trades, []);
+  });
+
+  it('test_getDeepTrades_smoke_returns_rows_with_headers', async () => {
+    // Rows are arrays indexed to the header columns (the panel's own shape).
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const flat = expr.replace(/\s+/g, ' ');
+        if (flat.includes('sc.scrollTop = Math.min')) return true;
+        if (flat.includes('Trade number')) {
+          return { ok: true, deep: true, mode: 'deep', empty: false,
+            headers: ['Trade number', 'Type', 'Net PnL'],
+            rows: [['1', 'Long', '10.00USD'], ['2', 'Short', '-5.00USD']],
+            scroll: null, total: '2', source: 'dom' };
+        }
+        return readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.getDeepTrades({ max_trades: 25 });
+    assert.equal(r.success, true);
+    assert.equal(r.trades.length, 2);
+    assert.equal(r.trades[0]['Trade number'], '1');
+    assert.equal(r.trades[1]['Net PnL'], '-5.00USD');
+    // Every row must carry the full header set — a shifted column is a bug.
+    for (const h of r.headers) assert.ok(Object.prototype.hasOwnProperty.call(r.trades[0], h));
+  });
+
+  it('test_getDeepTrades_smoke_dedupes_virtualised_rows', async () => {
+    // A virtualised table renders one window at a time: the first scrape sees
+    // rows 1-3 and reports a scrollable container, then each scroll + re-read
+    // widens the window, overlapping on both edges. The collector must de-dupe
+    // so the overlapping rows cannot inflate the collection, and every row
+    // within the cap must be returned exactly once.
+    //
+    // The loop alternates two page-side expressions: the row scrape and a
+    // scroll-step probe (which moves the container and re-renders).
+    const SCRAPE = 'Trade number';
+    const SCROLL_STEP = 'sc.scrollTop = Math.min';
+    const windows = [[1, 2, 3], [3, 4, 5], [5, 6], []];   // last window = empty
+    let scrapeCount = 0;
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const flat = expr.replace(/\s+/g, ' ');
+        if (flat.includes(SCROLL_STEP)) {
+          return true;
+        }
+        if (flat.includes(SCRAPE)) {
+          const nums = windows[Math.min(scrapeCount, windows.length - 1)];
+          scrapeCount++;
+          return { ok: true, deep: true, mode: 'deep', empty: nums.length === 0,
+            headers: ['Trade number', 'Type', 'Net PnL'],
+            rows: nums.map((n) => [String(n), 'Long', '1.00USD']),
+            total: '6', source: 'dom',
+            scroll: { top: 0, height: 12, scrollHeight: 40 } };
+        }
+        return readAnswers[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.getDeepTrades({ max_trades: 25 });
+    assert.equal(r.success, true);
+    const ids = r.trades.map((t) => t['Trade number']).map(Number).sort((a, b) => a - b);
+    // De-dupe: every collected id appears exactly once.
+    assert.equal(new Set(ids).size, ids.length);
+    // The overlapping windows must not lose or duplicate a trade.
+    assert.deepEqual(ids, [1, 2, 3, 4, 5, 6]);
+    assert.equal(r.trade_count, 6);
+    assert.ok(scrapeCount >= 2, 'expected the scroll loop to re-scrape at least once');
+  });
+
 });

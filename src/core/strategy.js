@@ -619,3 +619,255 @@ export async function getEquitySummary({ _deps } = {}) {
     note: 'Legend values only — the equity curve series is canvas-rendered and out of scope for this tool.',
   };
 }
+
+// ---------------------------------------------------------------------------
+// R3 — strategy_get_deep_trades (virtualised per-trade table, scroll/collect)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the per-trade table on the Strategy Tester's "List of trades" tab.
+ *
+ * The table is VIRTUALISED: only ~12 of N rows are in the DOM at a time, so
+ * a single scrape misses the rest. This tool:
+ *   1. clicks the trade-list header tab (real CDP mouse, not .click());
+ *   2. reads the visible rows;
+ *   3. scrolls the table's container down, re-reads, and de-dupes by
+ *      trade number until scrolling stops producing new rows;
+ *   4. returns the collected rows in the panel's own (newest-first) order.
+ *
+ * The `max_trades` cap limits how many rows are returned. When the panel
+ * shows the STANDARD backtest the trade count is small and the loop
+ * terminates after one or two scrolls — the same scrape works in both modes.
+ * The empty-table case (a range with zero trades) returns trade_count: 0
+ * with an explanatory note rather than an error.
+ */
+export async function getDeepTrades({ max_trades = 500, _deps } = {}) {
+  const { evaluate } = _resolve(_deps);
+  const cap = Math.max(1, Math.min(Number(max_trades) || 500, 5000));
+
+  // Step 1 — switch the panel to the trade-list tab. The two unlabeled icon
+  // tabs in the header: index 0 = performance/summary, index 1 = trade list.
+  // Use a real mouse event at the tab's centre so the panel's React handler
+  // fires; a stray .click() on the range button would collapse the panel.
+  const tabClicked = await evaluate(`
+    (function() {
+      try {
+        var shell = document.querySelector('[class*="reportShell-" i]');
+        if (!shell) return { ok: false, error: 'panel_not_open' };
+        var tabs = [].slice.call(shell.querySelectorAll('[role="tab"]'));
+        // The summary/trade-list tabs are the small icon tabs near the top
+        // of the panel (height < 60, and not the analysis sub-tabs which are
+        // lower on the page).
+        var iconTabs = tabs.filter(function (b) {
+          var r = b.getBoundingClientRect();
+          return r.height > 0 && r.height < 60 && r.width < 60 && b.offsetParent !== null;
+        });
+        if (iconTabs.length < 2) return { ok: false, error: 'trade-list tab not found' };
+        var target = iconTabs[1]; // index 1 = List of trades
+        var r2 = target.getBoundingClientRect();
+        // Report coordinates; the mouse event is dispatched by the caller
+        // so a single evaluate doesn't mix a read and a side-effect. The
+        // devicePixelRatio is included because CDP mouse events are
+        // device-pixel but getBoundingClientRect is CSS-pixel.
+        return { ok: true, x: Math.round(r2.x + r2.width / 2), y: Math.round(r2.y + r2.height / 2), dpr: window.devicePixelRatio || 1 };
+      } catch (e) {
+        return { ok: false, error: 'page-side: ' + String(e && e.message || e) };
+      }
+    })()
+  `);
+  if (!tabClicked || tabClicked.ok !== true) {
+    const err = tabClicked?.error === 'panel_not_open'
+      ? 'Strategy Tester panel not open — open it before reading the trade list.'
+      : (tabClicked?.error || 'could not locate the trade-list tab');
+    return { success: false, error: err, source: 'dom' };
+  }
+
+  // Click the tab with a real CDP mouse event, scaled CSS→device pixels
+  // (dispatchMouseEvent expects device pixels; a CSS-pixel click misses on
+  // HiDPI displays — see ui.js mouseClick).
+  {
+    const { x, y, dpr } = tabClicked;
+    const { getClient } = _resolve(_deps);
+    const client = await getClient();
+    const dx = Math.round(x * (dpr || 1));
+    const dy = Math.round(y * (dpr || 1));
+    await client.Input.dispatchMouseEvent({ type: 'mouseMoved', x: dx, y: dy });
+    await client.Input.dispatchMouseEvent({ type: 'mousePressed', x: dx, y: dy, button: 'left', buttons: 1, clickCount: 1 });
+    await client.Input.dispatchMouseEvent({ type: 'mouseReleased', x: dx, y: dy, button: 'left' });
+  }
+  await new Promise(r => setTimeout(r, 800));
+
+  const scrape = async () => evaluate(`
+    (function() {
+      try {
+        ${CLEAN_SRC}
+        var shell = document.querySelector('[class*="reportShell-" i]');
+        if (!shell) return { ok: false, error: 'panel_not_open' };
+        var text = (shell.innerText || '');
+        var deep = /(^|\\s)DEEP(\\s|$)/.test(text);
+
+        // Find the virtualised table: a <table> inside the panel whose header
+        // row is the trade-list columns.
+        var tables = shell.querySelectorAll('table');
+        var table = null;
+        for (var i = 0; i < tables.length; i++) {
+          var head = (tables[i].querySelector('thead') || tables[i]).textContent;
+          if (/Trade number/i.test(head)) { table = tables[i]; break; }
+        }
+        if (!table) return { ok: true, deep: deep, mode: deep ? 'deep' : 'standard', rows: [], empty: true, source: 'dom' };
+
+        // Scroll container: the nearest scrollable ancestor of the table.
+        var scroller = null;
+        var sc = table;
+        while (sc && sc !== shell) {
+          if (sc.scrollHeight > sc.clientHeight + 4) { scroller = sc; break; }
+          sc = sc.parentElement;
+        }
+
+        // Read the visible rows, splitting each cell on newline so the
+        // exit/entry pair stays intact.
+        var headerCells = [].slice.call(table.querySelectorAll('thead th')).map(function (c) { return (c.textContent || '').trim(); });
+        var rows = [];
+        [].slice.call(table.querySelectorAll('tbody tr')).forEach(function (tr) {
+          var cells = [].slice.call(tr.querySelectorAll('td')).map(function (c) {
+            return (c.innerText || '').split('\\n').map(function (x) { return x.trim(); }).filter(Boolean).join(' | ');
+          });
+          if (cells.length) rows.push(cells);
+        });
+
+        // Report the trade-count footer when present (the "List of trades"
+        // header states the total), plus the scroll position for the caller.
+        var total = null;
+        var m = text.match(/List of trades\\s*([0-9][0-9,]*)/i);
+        if (m) total = m[1];
+
+        return {
+          ok: true,
+          deep: deep,
+          mode: deep ? 'deep' : 'standard',
+          headers: headerCells,
+          rows: rows,
+          total: total,
+          scroll: scroller ? { top: scroller.scrollTop, height: scroller.clientHeight, scrollHeight: scroller.scrollHeight } : null,
+          source: 'dom',
+        };
+      } catch (e) {
+        return { ok: false, error: 'page-side: ' + String(e && e.message || e) };
+      }
+    })()
+  `);
+
+  const first = await scrape();
+  if (!first || first.ok !== true) {
+    return {
+      success: false,
+      error: first?.error === 'panel_not_open'
+        ? 'Strategy Tester panel not open — open it before reading the trade list.'
+        : (first?.error || 'trade-list scrape failed'),
+      source: 'dom',
+    };
+  }
+  if (first.empty) {
+    return {
+      success: true,
+      mode: first.mode,
+      deep: first.deep,
+      trade_count: 0,
+      collected: 0,
+      headers: first.headers || [],
+      trades: [],
+      empty: true,
+      note: 'The per-trade table has no rows for the current range (zero closed trades).',
+      source: 'dom',
+    };
+  }
+
+  // Scroll/collect loop. De-dupe by the trade-number column (index 0) which
+  // is unique even though rows show an exit/entry pair.
+  const collected = {};
+  const order = [];
+  const ingest = (rows) => {
+    for (const row of rows) {
+      const id = String(row[0] || '');
+      if (!id || collected[id]) continue;
+      collected[id] = row;
+      order.push(id);
+    }
+  };
+  ingest(first.rows);
+
+  // Total trade count from the footer if available — lets us stop early
+  // without scrolling the whole virtualised list when it is tiny.
+  let knownTotal = null;
+  if (first.total) knownTotal = Number(first.total.replace(/[^\d]/g, ''));
+
+  let scroller = first.scroll;
+  let guard = 0;
+  const MAX_SCROLLS = 400; // hard cap so a mis-detected scroller can't hang.
+  while (scroller && guard < MAX_SCROLLS) {
+    const full = knownTotal && Object.keys(collected).length >= knownTotal;
+    if (full || Object.keys(collected).length >= cap) break;
+    // Scroll one viewport down and re-read.
+    await evaluate(`
+      (function() {
+        var shell = document.querySelector('[class*="reportShell-" i]');
+        if (!shell) return false;
+        var table = null;
+        var tables = shell.querySelectorAll('table');
+        for (var i = 0; i < tables.length; i++) {
+          if (/Trade number/i.test((tables[i].querySelector('thead') || tables[i]).textContent)) { table = tables[i]; break; }
+        }
+        var sc = table;
+        while (sc && sc !== shell) {
+          if (sc.scrollHeight > sc.clientHeight + 4) break;
+          sc = sc.parentElement;
+        }
+        if (!sc) return false;
+        // Kendo's virtual grid re-renders lazily: a small scroll step settles
+        // back onto the same window of rows and the loop makes no progress.
+        // Jump two viewports at a time and let it settle — the de-dupe in the
+        // collector absorbs the overlap between windows.
+        sc.scrollTop = Math.min(sc.scrollHeight, sc.scrollTop + sc.clientHeight * 2);
+        sc.dispatchEvent(new Event('scroll', { bubbles: true }));
+        return true;
+      })()
+    `);
+    await new Promise(r => setTimeout(r, 450));
+    const probe = await scrape();
+    if (!probe || probe.ok !== true || probe.empty) break;
+    const before = Object.keys(collected).length;
+    ingest(probe.rows);
+    // No progress AND we are not at the bottom → stop. No progress at the
+    // bottom means the list is fully drained.
+    const atBottom = scroller && scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 10;
+    if (Object.keys(collected).length === before && atBottom) break;
+    if (Object.keys(collected).length === before && !atBottom && guard > 2) break;
+    scroller = probe.scroll;
+    guard++;
+  }
+
+  const trades = order
+    .map((id) => collected[id])
+    .slice(0, cap)
+    .map((row) => {
+      const out = {};
+      const headers = first.headers || [];
+      headers.forEach((h, i) => { out[h] = row[i] ?? null; });
+      out.Trade_number = row[0];
+      return out;
+    });
+
+  return {
+    success: true,
+    deep: first.deep,
+    mode: first.mode,
+    source: 'dom',
+    trade_count: knownTotal || trades.length,
+    collected: trades.length,
+    headers: first.headers || [],
+    trades,
+    note: knownTotal && knownTotal > trades.length
+      ? `collected ${trades.length} of ${knownTotal} (cap ${cap}); scroll the panel to read the rest.`
+      : undefined,
+  };
+}
