@@ -1,7 +1,7 @@
 /**
  * Core health/discovery/launch/reconnect logic.
  */
-import { getClient as _getClient, getTargetInfo as _getTargetInfo, evaluate as _evaluate, disconnect as _disconnect, CDP_PORT } from '../connection.js';
+import { getClient as _getClient, getTargetInfo as _getTargetInfo, evaluate as _evaluate, disconnect as _disconnect, CDP_PORT, getCdpHost, getCdpPort } from '../connection.js';
 import { waitForChartReady as _waitForChartReady } from '../wait.js';
 import { detectPopups as _detectPopups, dismissPopups as _dismissPopups } from './ui.js';
 
@@ -276,6 +276,10 @@ export async function uiState({ _deps } = {}) {
 }
 
 export async function launch({ port, kill_existing } = {}) {
+  // Call-time CDP probe URL: host/port resolve at the moment of the call so a
+  // process that captured localhost:9222 at load still probes the
+  // TV_CDP_HOST/TV_CDP_PORT the caller configured.
+  const _cdpUrl = (p) => `http://${getCdpHost()}:${p}/json/version`;
   const cdpPort = port || getCdpPort();
   const boundPort = getCdpPort();
   const portMismatch = port && port !== boundPort;
@@ -512,6 +516,7 @@ export async function ensureCDP({ _deps } = {}) {
   // the env-configured port instead. Use TV_CDP_PORT and restart the server
   // to point at a different instance.
   const cdpPort = getCdpPort();
+  const _cdpUrl = (p) => `http://${getCdpHost()}:${p}/json/version`;
   const probeUrl = _cdpUrl(cdpPort);
   const http = await import('http');
 
