@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { boolish } from './_validation.js';
 import { jsonResult } from './_format.js';
 import * as core from '../core/strategy.js';
 
@@ -12,6 +13,24 @@ export function registerStrategyTools(server) {
     },
     async ({ from, to }) => {
       try { return jsonResult(await core.setDeepBacktestRange({ from, to })); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
+  server.tool(
+    'strategy_read_deep_stats',
+    'Read the Strategy Tester panel\'s key stats, performance-analysis cards and trade count straight off the DOM panel — the only surface that carries Premium Deep Backtest results. While a DEEP range is selected, the internal _reportData still holds the STANDARD backtest, so data_get_strategy_results / data_get_trades / data_get_equity will show different numbers; this tool reports the mode it observed ("deep" or "standard") plus the date range so the two can never be mixed. Guards the brief "undefined" window while a deep run recomputes: if the key-stat cards are mid-refresh it reports recomputing:true instead of returning garbage. Requires the Strategy Tester panel to be open.',
+    {
+      wait: boolish.optional().describe('Poll until the panel holds real values (key-stat cards stop showing undefined) instead of returning a recomputing:true result (default false)'),
+      wait_timeout_ms: z.coerce.number().optional().describe('Max time to poll when wait:true (default 45000)'),
+    },
+    async ({ wait, wait_timeout_ms }) => {
+      try {
+        return jsonResult(await core.readDeepStats({
+          wait,
+          wait_timeout_ms,
+        }));
+      }
       catch (err) { return jsonResult({ success: false, error: err.message }, true); }
     }
   );
