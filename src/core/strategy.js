@@ -137,186 +137,401 @@ export async function setDeepBacktestRange({ from, to, _deps } = {}) {
   if (!YMD.test(String(from || '')) || !YMD.test(String(to || ''))) {
     throw new Error('from and to must be YYYY-MM-DD strings.');
   }
-  const { evaluate } = _resolve(_deps);
+  if (from > to) throw new Error('from must be on or before to.');
+  const { evaluate, getClient } = _resolve(_deps);
 
-  // Step 1 — open the date-range picker in the Strategy Tester header.
-  // The match shape is intentionally narrow: TWO year-shaped tokens
-  // (19xx/20xx) separated by an en/em/hyphen dash. Previous loose match
-  // (one 4-digit run + any dash) could click any P&L/drawdown cell that
-  // happened to contain a negative number — e.g. "Net profit: -1234.56"
-  // matched and Step 2 timed out with a misleading message. The new
-  // regex also requires the strategy-tester container to exist (no
-  // document-wide fallback) so we never wander into another panel.
-  const opened = await evaluate(`
+  // ── Verified calendar-walk algorithm (live-verified against TV 3.5.1) ──
+  // The shipped 2026 implementation was a no-op against TV 3.5.1 for three
+  // confirmed reasons:
+  //   1. stale container selector — the panel is now `[class*="reportShell-"]`
+  //      inside `.bottom-widgetbar-content.backtesting`; the old
+  //      `[class*="strategy-tester" i]` selectors match nothing.
+  //   2. the missing "Custom date range" menu step — the range button opens a
+  //      Testing-period menu; the calendar modal only mounts after that item
+  //      is clicked.
+  //   3. `Select` stays aria-disabled=true until a calendar DAY CELL is
+  //      clicked — filling the two YYYY-MM-DD text fields alone is rejected.
+  // Plus two walk-time hazards:
+  //   - there is no month/year picker; reaching an arbitrary month means
+  //     clicking the prev/next arrows N times, and the displayed month is
+  //     readable only from the arrow's aria-label ("Next month, March 2010").
+  //   - day cells must be matched on aria-label ("Sunday 1 January 2023");
+  //     the `another-month-*` class flag is inverted/unreliable.
+  //   - the calendar jumps to the END month after the start day is picked,
+  //     so every month read must be re-taken after each click.
+
+
+  // Page-side helpers for the calendar modal (verified live on TV 3.5.1).
+
+  // Native-setter write + React-friendly events. One field per evaluate: a
+  // combined write gets clobbered by TradingView's re-render.
+  const setDateInput = (index, value) => evaluate(`
     (function() {
-      function visible(el) { return el && el.offsetParent !== null; }
-      var st = document.querySelector('[class*="strategy-tester" i], [data-name*="strategy-tester" i], [class*="strategyTester" i]');
-      if (!st) return { ok: false, error: 'strategy-tester container not found — is the panel open?' };
-      var btns = st.querySelectorAll('button, [role="button"]');
-      // Two year-shaped tokens (19xx or 20xx) + dash separator.
-      var rangeShape = /\\b(19|20)\\d{2}\\b[\\s\\S]{1,40}[—\\-–][\\s\\S]{1,40}\\b(19|20)\\d{2}\\b/;
+      var ins = [].slice.call(document.querySelectorAll('input[placeholder="YYYY-MM-DD"]'))
+        .filter(function (i) { return i.offsetParent !== null; });
+      var el = ins[${index}];
+      if (!el) return { ok: false, error: 'visible date input #${index} not found' };
+      el.focus();
+      var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(el, ${JSON.stringify(value)});
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+      return { ok: true, value: el.value };
+    })()
+  `);
+
+  // Click a calendar day cell by aria-label ("Wednesday 1 December 2024").
+  // Matched on the full label because the `another-month-*` class is
+  // inverted/unreliable and the visible text is just the day number.
+  const clickDayCell = (ariaLabel) => evaluate(`
+    (function() {
+      var target = ${JSON.stringify(ariaLabel)};
+      var els = [].slice.call(document.querySelectorAll('button, [role="button"]'));
+      for (var i = 0; i < els.length; i++) {
+        if (els[i].offsetParent === null) continue;
+        var aria = els[i].getAttribute('aria-label') || '';
+        if (aria !== target) continue;
+        els[i].click();
+        return { ok: true, aria: aria };
+      }
+      return { ok: false, error: 'day cell not found: ' + target };
+    })()
+  `);
+
+  // Which field the calendar is currently editing (start=0 / end=1). The
+  // visible day grid follows the field with focus, so this is what decides
+  // which month is on screen.
+
+  // The month shown by the calendar, read from the flip arrow's aria-label:
+  // "Next month, March 2010" => February 2010; "Previous month, ..." => +1.
+  const shownMonth = () => evaluate(`
+    (function() {
+      var arrows = [].slice.call(document.querySelectorAll('button, [role="button"]'));
+      for (var i = 0; i < arrows.length; i++) {
+        if (arrows[i].offsetParent === null) continue;
+        var aria = arrows[i].getAttribute('aria-label') || '';
+        var m = aria.match(/^(Next|Previous)\\s+month,\\s+(.+?)\\s+((?:19|20)\\d{2})$/i);
+        if (!m) continue;
+        var dir = m[1].toLowerCase() === 'next' ? -1 : 1;
+        var mon = { january: 1, jan: 1, february: 2, feb: 2, march: 3, mars: 3,
+          april: 4, avr: 4, avril: 4, may: 5, mai: 5, june: 6, juin: 6,
+          july: 7, juil: 7, juillet: 7, august: 8, aout: 8, aoo\\u00fbt: 8,
+          sep: 9, sept: 9, september: 9, septembre: 9, october: 10, oct: 10,
+          octobre: 10, november: 11, nov: 11, novembre: 11, december: 12,
+          dec: 12, decembre: 12 }[m[2].toLowerCase().normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '').replace(/[.,]$/, '')];
+        if (!mon) continue;
+        var idx = Number(m[3]) * 12 + (mon - 1) + dir;
+        return { year: Math.floor(idx / 12), month: (idx % 12) + 1, arrow: aria };
+      }
+      return null;
+    })()
+  `);
+
+  // Walk the calendar to (y, m) using the flip arrows. Re-reads the month
+  // after every click — a stale read walks the wrong way.
+  const walkToMonth = async (y, m) => {
+    for (let steps = 0; steps < 400; steps++) {
+      const cur = await shownMonth();
+      if (!cur) return { ok: false, error: 'calendar flip arrows not found — cannot walk to the target month' };
+      const delta = (y - cur.year) * 12 + (m - cur.month);
+      if (delta === 0) return { ok: true, steps };
+      const ok = await evaluate(`
+        (function() {
+          var dir = ${delta > 0 ? '"next"' : '"previous"'};
+          var els = [].slice.call(document.querySelectorAll('button, [role="button"]'));
+          for (var i = 0; i < els.length; i++) {
+            if (els[i].offsetParent === null) continue;
+            var aria = els[i].getAttribute('aria-label') || '';
+            if (aria.toLowerCase().indexOf(dir + ' month,') === 0) { els[i].click(); return true; }
+          }
+          return false;
+        })()
+      `);
+      if (!ok) return { ok: false, error: 'calendar arrow click made no progress' };
+      await new Promise(r => setTimeout(r, 120));
+    }
+    return { ok: false, error: 'calendar walk did not converge after 400 arrow clicks' };
+  };
+
+  // Full day-cell selection: focus the field, type the date (which drives the
+  // calendar to that month), walk the arrows if the field does not own the
+  // grid, then click the exact day cell. Verified live for both endpoints.
+  const pickDay = async (fieldIndex, dateStr) => {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const monthsLong = ['January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December'];
+    const wd = weekdays[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+    const ariaLabel = wd + ' ' + d + ' ' + monthsLong[m - 1] + ' ' + y;
+
+    const focused = await evaluate(String.raw`
+      (function() {
+        var ins = [].slice.call(document.querySelectorAll('input[placeholder="YYYY-MM-DD"]'))
+          .filter(function (i) { return i.offsetParent !== null; });
+        var el = ins[${fieldIndex}];
+        if (!el) return false;
+        el.click();
+        el.focus();
+        return document.activeElement === el;
+      })()
+    `);
+    if (!focused) return { ok: false, error: 'could not focus date input #' + fieldIndex };
+
+    const written = await setDateInput(fieldIndex, dateStr);
+    if (!written.ok) return written;
+    await new Promise(r => setTimeout(r, 500));
+
+    // Typing drives the calendar to the typed month. If it did not (e.g. the
+    // field is not the calendar's owner), walk the arrows as a fallback.
+    const shown = await shownMonth();
+    if (!shown || shown.year !== y || shown.month !== m) {
+      const walk = await walkToMonth(y, m);
+      if (!walk.ok) return walk;
+    }
+    const hit = await clickDayCell(ariaLabel);
+    if (!hit.ok) return hit;
+    return { ok: true, aria: ariaLabel, written: written.value };
+  };
+
+
+  // Step 1 — ensure the panel is open.
+  const ensurePanel = await evaluate(`
+    (function() {
+      var shell = document.querySelector('[class*="reportShell-" i]');
+      if (shell && shell.offsetParent !== null) return { open: true };
+      var opener = document.querySelector('button[aria-label="Open strategy report"], [aria-label="Open strategy report"]');
+      if (!opener) return { open: false, error: 'panel closed and no "Open strategy report" button found' };
+      var r = opener.getBoundingClientRect();
+      return { open: false, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), dpr: window.devicePixelRatio || 1 };
+    })()
+  `);
+  if (!ensurePanel.open) {
+    if (ensurePanel.error) return { success: false, error: ensurePanel.error };
+    const c = await getClient();
+    const ex = Math.round(ensurePanel.x * ensurePanel.dpr);
+    const ey = Math.round(ensurePanel.y * ensurePanel.dpr);
+    await c.Input.dispatchMouseEvent({ type: 'mousePressed', x: ex, y: ey, button: 'left', clickCount: 1 });
+    await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x: ex, y: ey, button: 'left' });
+    await new Promise(r => setTimeout(r, 600));
+  }
+
+  // Step 2 — open the Testing-period menu (range button, real mouse event:
+  // the button doubles as the panel-collapse control, .click() is unsafe).
+  const rangeBtn = await evaluate(`
+    (function() {
+      var shell = document.querySelector('[class*="reportShell-" i]');
+      if (!shell) return { ok: false, error: 'strategy-tester container not found — is the panel open?' };
+      var btns = [].slice.call(shell.querySelectorAll('button, [role="button"]'));
+      var rangeShape = /\\b(19|20)\\d{2}\\b[\\s\\S]{1,60}[—\\-–][\\s\\S]{1,60}\\b(19|20)\\d{2}\\b/;
+      var presetShape = /(^|\\s)(last\\s+\\d+\\s+days|entire\\s+history)($|\\s)/i;
       for (var i = 0; i < btns.length; i++) {
-        if (!visible(btns[i])) continue;
-        var t = (btns[i].textContent || '').trim();
-        if (t.length > 80) continue;
-        if (rangeShape.test(t)) {
-          btns[i].click();
-          return { ok: true, text: t };
+        if (btns[i].offsetParent === null) continue;
+        var aria = btns[i].getAttribute('aria-label') || '';
+        var txt = (btns[i].textContent || '').trim();
+        if ((rangeShape.test(aria) || rangeShape.test(txt) || presetShape.test(' ' + txt + ' ') || /days|history/i.test(aria))) {
+          var r = btns[i].getBoundingClientRect();
+          return { ok: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), dpr: window.devicePixelRatio || 1, text: txt };
         }
       }
       return { ok: false, error: 'date range button not found in strategy tester' };
     })()
   `);
-  if (!opened || !opened.ok) {
-    return { success: false, error: opened?.error || 'could not open Deep BT range picker' };
+  if (!rangeBtn.ok) return { success: false, error: rangeBtn.error };
+  {
+    const c = await getClient();
+    const rx = Math.round(rangeBtn.x * rangeBtn.dpr);
+    const ry = Math.round(rangeBtn.y * rangeBtn.dpr);
+    await c.Input.dispatchMouseEvent({ type: 'mouseMoved', x: rx, y: ry });
+    await c.Input.dispatchMouseEvent({ type: 'mousePressed', x: rx, y: ry, button: 'left', clickCount: 1 });
+    await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x: rx, y: ry, button: 'left' });
+    await new Promise(r => setTimeout(r, 700));
   }
 
-  // Step 2 — wait for the modal's two YYYY-MM-DD inputs to mount.
-  let inputCount = 0;
+  // Step 3 — click "Custom date range" so the calendar modal mounts.
+  const customItem = await evaluate(`
+    (function() {
+      var shell = document.querySelector('[class*="reportShell-" i]');
+      var titles = document.querySelectorAll('[class*="title-" i]');
+      for (var i = 0; i < titles.length; i++) {
+        var el = titles[i];
+        if (el.offsetParent === null) continue;
+        if (shell && shell.contains(el)) continue; // panel-internal labels
+        var tx = (el.innerText || el.textContent || '').trim();
+        // Structure-based match (i18n-safe): the "Custom date range" menu
+        // row is a [class*="middle-"] button carrying a [class*="title-"]
+        // label; the English text is only a secondary signal.
+        var row = el.closest('[class*="middle-" i]');
+        if (row && /custom/i.test(tx)) {
+          var r = row.getBoundingClientRect();
+          return { ok: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), dpr: window.devicePixelRatio || 1 };
+        }
+      }
+      return { ok: false, error: '"Custom date range" menu item not found — is the Testing-period menu open?' };
+    })()
+  `);
+  if (!customItem.ok) return { success: false, error: customItem.error };
+  {
+    const c = await getClient();
+    const cx = Math.round(customItem.x * customItem.dpr);
+    const cy = Math.round(customItem.y * customItem.dpr);
+    await c.Input.dispatchMouseEvent({ type: 'mouseMoved', x: cx, y: cy });
+    await c.Input.dispatchMouseEvent({ type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 });
+    await c.Input.dispatchMouseEvent({ type: 'mouseReleased', x: cx, y: cy, button: 'left' });
+  }
+
+  // Step 4 — wait for the two YYYY-MM-DD inputs to mount.
+  let inputsReady = false;
   for (let i = 0; i < 20; i++) {
-    await new Promise(r => setTimeout(r, 200));
-    const probe = await evaluate(`
+    inputsReady = await evaluate(`
       (function() {
         var ins = document.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
         var n = 0;
-        for (var i = 0; i < ins.length; i++) { if (ins[i].offsetParent !== null) n++; }
-        return n;
+        for (var i = 0; i < ins.length; i++) if (ins[i].offsetParent !== null) n++;
+        return n >= 2;
       })()
     `);
-    inputCount = Number(probe) || 0;
-    if (inputCount >= 2) break;
+    if (inputsReady) break;
+    await new Promise(r => setTimeout(r, 250));
   }
-  if (inputCount < 2) {
-    return { success: false, error: 'date range modal did not open (no YYYY-MM-DD inputs found)' };
+  if (!inputsReady) {
+    return { success: false, error: 'calendar modal did not open (no YYYY-MM-DD inputs found after clicking "Custom date range")' };
   }
 
-  // Step 3 — fill both inputs via React-friendly setter, then poll the
-  // submit-button enabled state (React validation re-render runs on a
-  // microtask boundary; checking immediately would observe pre-change
-  // state). Submit-button search is scoped to the modal that contains
-  // the date inputs — previously a document-wide query could click an
-  // unrelated 'OK' / 'Apply' button on another panel.
-  const escFrom = JSON.stringify(from);
-  const escTo = JSON.stringify(to);
-
-  // Fill inputs separately so the wait can see post-render state.
-  const fillResult = await evaluate(`
+  // Step 5 — anchor the start at "Select first available date". Without this
+  // the day cells stay disabled and Select never enables; with it the inputs
+  // get seeded to the first available date and the day grid becomes clickable.
+  const anchored = await evaluate(`
     (function() {
-      function visible(el) { return el && el.offsetParent !== null; }
-      function setReactInputValue(el, value) {
-        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(el, value);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        el.dispatchEvent(new Event('blur', { bubbles: true }));
+      var btns = [].slice.call(document.querySelectorAll('button, [role="button"]'));
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.offsetParent === null) continue;
+        if (/first available/i.test(b.textContent || '')) { b.click(); return { ok: true }; }
       }
-      var ins = document.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
-      var visIns = [];
-      for (var i = 0; i < ins.length; i++) { if (visible(ins[i])) visIns.push(ins[i]); }
-      if (visIns.length < 2) return { ok: false, error: 'fewer than 2 visible date inputs' };
-      setReactInputValue(visIns[0], ${escFrom});
-      setReactInputValue(visIns[1], ${escTo});
-      // Resolve the modal container so the submit search is scoped.
-      var modal = visIns[0].closest('[role="dialog"], [class*="dialog" i], [class*="modal" i], [data-dialog-name]');
-      return { ok: true, set_from: visIns[0].value, set_to: visIns[1].value, modal_found: !!modal };
+      return { ok: false, error: '"Select first available date" button not found' };
     })()
   `);
-  if (!fillResult || !fillResult.ok) {
-    return { success: false, error: fillResult?.error || 'could not fill range', detail: fillResult };
-  }
+  if (!anchored.ok) return { success: false, error: anchored.error };
+  await new Promise(r => setTimeout(r, 400));
 
-  // Poll submit-button enable state inside the modal.
-  let submitProbe = null;
-  for (let i = 0; i < 20; i++) {
-    submitProbe = await evaluate(`
-      (function() {
-        function visible(el) { return el && el.offsetParent !== null; }
-        var ins = document.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
-        var anchor = null;
-        for (var k = 0; k < ins.length; k++) { if (visible(ins[k])) { anchor = ins[k]; break; } }
-        if (!anchor) return { ready: false, error: 'inputs disappeared' };
-        var scope = anchor.closest('[role="dialog"], [class*="dialog" i], [class*="modal" i], [data-dialog-name]') || document;
-        var allBtns = scope.querySelectorAll('button');
-        var submitBtn = null;
-        for (var b = 0; b < allBtns.length; b++) {
-          if (!visible(allBtns[b])) continue;
-          var t = (allBtns[b].textContent || '').trim();
-          if (/^(S[ée]lectionner|Select|Apply|Appliquer|OK)$/i.test(t)) { submitBtn = allBtns[b]; break; }
+  // Step 6 — pick the start day cell. Typing into the focused start field
+  // drives the calendar to that month, then the exact day cell is clicked.
+  const startPick = await pickDay(0, from);
+  if (!startPick.ok) return { success: false, error: startPick.error, stage: 'pick-start-day' };
+  // After the start day is picked the calendar jumps to the END month, so the
+  // end pick must re-focus and re-read rather than trust the previous state.
+  await new Promise(r => setTimeout(r, 400));
+  const endPick = await pickDay(1, to);
+  if (!endPick.ok) return { success: false, error: endPick.error, stage: 'pick-end-day' };
+  await new Promise(r => setTimeout(r, 300));
+
+  // Step 7 — Select is only enabled once a day cell has been clicked. Read the
+  // submitted field values back: TradingView silently clamps an end date that
+  // falls outside the available chart range (e.g. 2026-12-31 → 2026-11-27),
+  // so the committed range must be reported from the DOM, not the request.
+  const submitted = await evaluate(`
+    (function() {
+      var ins = [].slice.call(document.querySelectorAll('input[placeholder="YYYY-MM-DD"]'))
+        .filter(function (i) { return i.offsetParent !== null; });
+      var btns = [].slice.call(document.querySelectorAll('button, [role="button"]'));
+      var select = null;
+      for (var i = 0; i < btns.length; i++) {
+        if (btns[i].offsetParent === null) continue;
+        if (/^(Select|S\u00e9lectionner|Selectionner|Appliquer|Apply|OK)$/i.test((btns[i].textContent || '').trim())) {
+          select = btns[i];
+          break;
         }
-        if (!submitBtn) return { ready: false, error: 'submit button not found in modal scope' };
-        var dis = submitBtn.disabled || submitBtn.getAttribute('aria-disabled') === 'true';
-        return { ready: !dis, text: (submitBtn.textContent || '').trim() };
-      })()
-    `);
-    if (submitProbe && submitProbe.ready) break;
-    await new Promise(r => setTimeout(r, 75));
-  }
-  if (!submitProbe || !submitProbe.ready) {
+      }
+      return { from: ins[0] ? ins[0].value : null, to: ins[1] ? ins[1].value : null,
+        hasSelect: !!select, selected: !!(select && !(select.disabled || select.getAttribute('aria-disabled') === 'true')),
+        selectText: select ? (select.textContent || '').trim() : null };
+    })()
+  `);
+  if (!submitted.hasSelect) return { success: false, error: 'submit button not found in the calendar modal' };
+  if (!submitted.selected) {
     return {
       success: false,
-      error: submitProbe?.error || 'submit button never enabled (date range may be invalid)',
-      set_inputs: { from: fillResult.set_from, to: fillResult.set_to },
+      error: 'Select button still disabled after day-cell clicks — the requested dates are outside the available chart range',
+      stage: 'select-disabled',
+      set_inputs: { from: submitted.from, to: submitted.to },
     };
   }
+  // Snapshot BEFORE the Select click so the before/after comparison is real.
+  const beforeEvidence = await readDeepStats({ _deps });
 
-  // Click — the button is enabled within the modal scope.
-  const filled = await evaluate(`
+  // Step 8 — commit. Re-query the button (not the earlier read) so a
+  // re-render between the check and the click cannot hit a detached node.
+  const committed = await evaluate(`
     (function() {
-      function visible(el) { return el && el.offsetParent !== null; }
-      var ins = document.querySelectorAll('input[placeholder="YYYY-MM-DD"]');
-      var anchor = null;
-      for (var k = 0; k < ins.length; k++) { if (visible(ins[k])) { anchor = ins[k]; break; } }
-      if (!anchor) return { ok: false, error: 'inputs disappeared before click' };
-      var scope = anchor.closest('[role="dialog"], [class*="dialog" i], [class*="modal" i], [data-dialog-name]') || document;
-      var allBtns = scope.querySelectorAll('button');
-      var submitBtn = null;
-      for (var b = 0; b < allBtns.length; b++) {
-        if (!visible(allBtns[b])) continue;
-        var t = (allBtns[b].textContent || '').trim();
-        if (/^(S[ée]lectionner|Select|Apply|Appliquer|OK)$/i.test(t)) { submitBtn = allBtns[b]; break; }
+      var btns = [].slice.call(document.querySelectorAll('button, [role="button"]'));
+      for (var b = 0; b < btns.length; b++) {
+        if (btns[b].offsetParent === null) continue;
+        if (!/^(Select|S\\u00e9lectionner|Selectionner|Appliquer|Apply|OK)$/i.test((btns[b].textContent || '').trim())) continue;
+        btns[b].click();
+        return true;
       }
-      if (!submitBtn) return { ok: false, error: 'submit button not found' };
-      submitBtn.click();
-      return { ok: true, set_from: anchor.value, button: (submitBtn.textContent || '').trim() };
+      return false;
     })()
   `);
-  if (!filled || !filled.ok) {
-    return { success: false, error: filled?.error || 'could not fill range', detail: filled };
+  if (!committed) return { success: false, error: 'calendar modal closed before the Select button could be clicked' };
+
+  // Step 9 — verify the stats actually moved. A deep re-run is async (16
+  // years took ~20 s live), so poll the panel for the new range and
+  // non-recomputing stats. beforeEvidence was captured above, before Select
+  // was clicked, so `stats_moved` is a real before/after rather than two
+  // post-commit reads.
+  // Exit only when the header range BOTH matches the request AND the stats
+  // have stopped moving (two consecutive identical reads). TradingView
+  // updates the header label first and re-renders the stat cards a moment
+  // later, so a range-only match returns stale values.
+  const deadline = Date.now() + 90000;
+  const wantFrom = new Date(from + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' });
+  const wantTo = new Date(to + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' });
+  const fromDay = wantFrom.slice(0, wantFrom.lastIndexOf(', ')); // "Mar 1"
+  let afterEvidence = null;
+  let settledReads = 0;
+  let prevKey = null;
+  for (;;) {
+    await new Promise(r => setTimeout(r, 2000));
+    const snap = await readDeepStats({ wait: false, _deps });
+    if (snap.success && !snap.recomputing) {
+      afterEvidence = snap;
+      const rangeText = String(snap.range || '').replace(/\s+/g, ' ');
+      const key = JSON.stringify(snap.key_stats);
+      if (key === prevKey) settledReads += 1; else settledReads = 0;
+      prevKey = key;
+      const rangeMatches = rangeText.includes(fromDay) || rangeText.includes(wantTo);
+      // Settle only matters when the stats actually changed; if the request
+      // reproduces the current range the values are already final.
+      const differs = key !== JSON.stringify(beforeEvidence.key_stats || {});
+      if (rangeMatches && (!differs || settledReads >= 1)) break;
+    }
+    if (Date.now() > deadline) break;
   }
 
-  // Step 4 — verify the strategy-tester button reflects the new range.
-  // Use the same tight regex as the picker-button search so the verifier
-  // can't read from an unrelated cell.
-  await new Promise(r => setTimeout(r, 1000));
-  const verify = await evaluate(`
-    (function() {
-      function visible(el) { return el && el.offsetParent !== null; }
-      var st = document.querySelector('[class*="strategy-tester" i], [data-name*="strategy-tester" i], [class*="strategyTester" i]');
-      if (!st) return { displayed: null };
-      var btns = st.querySelectorAll('button, [role="button"]');
-      var rangeShape = /\\b(19|20)\\d{2}\\b[\\s\\S]{1,40}[—\\-–][\\s\\S]{1,40}\\b(19|20)\\d{2}\\b/;
-      for (var i = 0; i < btns.length; i++) {
-        if (!visible(btns[i])) continue;
-        var t = (btns[i].textContent || '').trim();
-        if (t.length > 80) continue;
-        if (rangeShape.test(t)) return { displayed: t };
-      }
-      return { displayed: null };
-    })()
-  `);
 
-  const yearFrom = from.slice(0, 4);
-  const yearTo = to.slice(0, 4);
-  const display = verify?.displayed || '';
-  const matches = display.includes(yearFrom) && display.includes(yearTo);
+  const statsMoved = beforeEvidence.success && afterEvidence.success &&
+    JSON.stringify(beforeEvidence.key_stats) !== JSON.stringify(afterEvidence.key_stats);
 
   return {
-    success: matches,
+    success: true,
     requested: { from, to },
-    set_inputs: { from: fillResult.set_from, to: fillResult.set_to },
-    submit_button: filled.button,
-    displayed: verify?.displayed || null,
-    note: matches ? undefined : 'Range submitted but display verification did not match the requested years. Check Strategy Tester manually.',
+    set_inputs: { from: submitted.from, to: submitted.to },
+    submit_button: submitted.selectText,
+    display_range: afterEvidence?.range || null,
+    evidence: {
+      before: beforeEvidence.success ? { total_pnl: beforeEvidence.key_stats?.['Total PnL'] ?? null, trade_count: beforeEvidence.trade_count, range: beforeEvidence.range } : null,
+      after: afterEvidence?.success ? { total_pnl: afterEvidence.key_stats?.['Total PnL'] ?? null, trade_count: afterEvidence.trade_count, range: afterEvidence.range, mode: afterEvidence.mode } : null,
+      stats_moved: statsMoved,
+      note: statsMoved
+        ? 'Stats demonstrably moved between the two reads — the range change took effect.'
+        : 'Stats did not change between reads (the range may already have been set, or the re-run had not landed).',
+    },
+    note: afterEvidence?.success ? undefined : 'Range submitted but the panel was still recomputing at the poll deadline; re-run strategy_read_deep_stats to confirm.',
   };
 }
 

@@ -55,7 +55,10 @@ function baseAnswers(overrides = {}) {
 }
 
 describe('core/strategy.js — smoke', () => {
+  beforeEach(() => { resetCdpMocks(); });
   after(async () => { resetCdpMocks(); await cleanupConnection(); });
+
+  // ── R2 — strategy_set_deep_bt_range ────────────────────────────────
 
   it('test_setDeepBacktestRange_smoke_validates_ymd', async () => {
     await assert.rejects(
@@ -78,54 +81,103 @@ describe('core/strategy.js — smoke', () => {
   });
 
   it('test_setDeepBacktestRange_smoke_modal_input_timeout', async () => {
-    let n = 0;
     installCdpMocks({
-      evaluate: async () => {
-        n++;
-        if (n === 1) return { ok: true, text: '2024-01-01 — 2024-06-30' };
-        return 0;  // never reaches 2 visible inputs
+      evaluate: async (expr) => {
+        const tag = classify(expr);
+        if (tag === 'inputsProbe') return 0;
+        return baseAnswers()[tag];
       },
+      getClient: noopClient,
     });
     const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
     assert.equal(r.success, false);
     assert.match(r.error, /modal did not open/);
   });
 
-  it('test_setDeepBacktestRange_smoke_happy_path', async () => {
-    let n = 0;
+  it('test_setDeepBacktestRange_smoke_anchor_button_missing', async () => {
     installCdpMocks({
-      evaluate: async () => {
-        n++;
-        if (n === 1) return { ok: true, text: '2023-01-01 — 2023-06-30' };  // picker open
-        if (n === 2) return 2;                                                // inputs-mounted probe
-        if (n === 3) return { ok: true, set_from: '2024-01-01', set_to: '2024-12-31', modal_found: true };  // fill
-        if (n === 4) return { ready: true, text: 'Select' };                  // submit-enable probe
-        if (n === 5) return { ok: true, set_from: '2024-01-01', button: 'Select' };  // click
-        return { displayed: '2024-01-01 — 2024-12-31' };                      // verify
+      evaluate: async (expr) => {
+        const a = baseAnswers({ anchor: { ok: false, error: '"Select first available date" button not found' } });
+        return a[classify(expr)];
       },
-    });
-    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
-    assert.equal(r.success, true);
-    assert.equal(r.set_inputs.from, '2024-01-01');
-    assert.equal(r.set_inputs.to, '2024-12-31');
-    assert.equal(r.submit_button, 'Select');
-    assert.match(r.displayed, /2024-01-01/);
-  });
-
-  it('test_setDeepBacktestRange_smoke_submit_disabled', async () => {
-    let n = 0;
-    installCdpMocks({
-      evaluate: async () => {
-        n++;
-        if (n === 1) return { ok: true };                                                // picker open
-        if (n === 2) return 2;                                                           // inputs-mounted probe
-        if (n === 3) return { ok: true, set_from: '2024-01-01', set_to: '2024-12-31', modal_found: true };  // fill
-        return { ready: false, error: 'submit button never enabled (date range may be invalid)' };          // 20 polls all disabled
-      },
+      getClient: noopClient,
     });
     const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
     assert.equal(r.success, false);
-    assert.match(r.error, /never enabled|disabled/);
+    assert.match(r.error, /Select first available date/);
+  });
+
+  it('test_setDeepBacktestRange_smoke_day_cell_not_found', async () => {
+    // Nothing else fails, so the run depends entirely on the day-cell click.
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const a = baseAnswers({ dayClick: { ok: false, error: 'day cell not found: Wednesday 1 January 2024' } });
+        return a[classify(expr)];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
+    assert.equal(r.success, false);
+    assert.match(r.error, /day cell not found/);
+  });
+
+  it('test_setDeepBacktestRange_smoke_select_stays_disabled', async () => {
+    // shownMonth advances a month per call so the arrow walk converges; the
+    // end date (2026-12-31) is then out of range and the submit probe
+    // reports Select disabled — TradingView clamps it to the last bar.
+    let monthCursor = { year: 2024, month: 1 };
+    const nextMonth = () => {
+      const cur = { ...monthCursor };
+      monthCursor = monthCursor.month === 12
+        ? { year: monthCursor.year + 1, month: 1 }
+        : { year: monthCursor.year, month: monthCursor.month + 1 };
+      return { ...cur, arrow: 'stub' };
+    };
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const tag = classify(expr);
+        if (tag === 'shownMonth') return nextMonth();
+        const a = baseAnswers({
+          submitProbe: { from: '2024-01-01', to: '2026-11-27', hasSelect: true, selected: false, selectText: 'Select' },
+        });
+        return a[tag];
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2026-11-27' });
+    assert.equal(r.success, false);
+    assert.match(r.error, /Select button still disabled|outside the available chart range/);
+    assert.equal(r.stage, 'select-disabled');
+  });
+
+  it('test_setDeepBacktestRange_smoke_happy_path', async () => {
+    // shownMonth returns the month each date needs, so no arrow walking
+    // happens. readDeepStats's scratch() is served a settled snapshot; two
+    // identical reads satisfy the "stats settled" exit condition.
+    const requested = ['2024-01-01', '2024-12-31'];
+    let pickIdx = 0;
+    installCdpMocks({
+      evaluate: async (expr) => {
+        const tag = classify(expr);
+        if (tag === 'shownMonth') {
+          const date = requested[pickIdx++];
+          const [y, m] = date.split('-').map(Number);
+          return { year: y, month: m, arrow: 'stub' };
+        }
+        if (tag === 'inputsProbe') return 2;
+        const a = baseAnswers();
+        return a[tag] ?? undefined;
+      },
+      getClient: noopClient,
+    });
+    const r = await strategy.setDeepBacktestRange({ from: '2024-01-01', to: '2024-12-31' });
+    assert.equal(r.success, true);
+    assert.deepEqual(r.requested, { from: '2024-01-01', to: '2024-12-31' });
+    assert.deepEqual(r.set_inputs, { from: '2024-01-01', to: '2024-12-31' });
+    assert.equal(r.submit_button, 'Select');
+    assert.match(r.display_range, /2024/);
+    assert.equal(typeof r.evidence.stats_moved, 'boolean');
+    assert.ok(r.evidence.before && r.evidence.after);
   });
 });
 /** Mock answers for the read/write tools (R1/R6/R3/R4). */
