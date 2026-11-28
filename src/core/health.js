@@ -276,8 +276,10 @@ export async function uiState({ _deps } = {}) {
 }
 
 export async function launch({ port, kill_existing } = {}) {
-  const cdpPort = port || CDP_PORT;
-  const portMismatch = port && port !== CDP_PORT;
+  const cdpPort = port || getCdpPort();
+  const boundPort = getCdpPort();
+  const portMismatch = port && port !== boundPort;
+  const probeUrl = _cdpUrl(cdpPort);
   const killFirst = kill_existing !== false;
   const platform = process.platform;
   const wsl = isWsl();
@@ -288,7 +290,7 @@ export async function launch({ port, kill_existing } = {}) {
   try {
     const http = await import('http');
     const alreadyUp = await new Promise((resolve) => {
-      const req = http.get(`http://localhost:${cdpPort}/json/version`, { timeout: 1500 }, (res) => {
+      const req = http.get(probeUrl, { timeout: 1500 }, (res) => { // resolved at call time
         let data = '';
         res.on('data', (c) => data += c);
         res.on('end', () => resolve(data));
@@ -303,7 +305,7 @@ export async function launch({ port, kill_existing } = {}) {
       return {
         success: true, platform: wsl ? 'wsl' : platform,
         binary: '(already running)', cdp_port: cdpPort,
-        cdp_url: `http://localhost:${cdpPort}`,
+        cdp_url: `http://${getCdpHost()}:${cdpPort}`,
         browser: info.Browser, user_agent: info['User-Agent'],
         already_running: true,
         ...(portMismatch ? { warning: `Launched on port ${cdpPort} but the MCP server's CDP client is bound to ${CDP_PORT}. Set TV_CDP_PORT=${cdpPort} and restart the server, or relaunch on ${CDP_PORT}.` } : {}),
@@ -468,7 +470,7 @@ export async function launch({ port, kill_existing } = {}) {
     try {
       const http = await import('http');
       const ready = await new Promise((resolve) => {
-        const req = http.get(`http://localhost:${cdpPort}/json/version`, { timeout: 1500 }, (res) => {
+        const req = http.get(probeUrl, { timeout: 1500 }, (res) => { // resolved at call time
           let data = '';
           res.on('data', (chunk) => data += chunk);
           res.on('end', () => resolve(data));
@@ -480,7 +482,7 @@ export async function launch({ port, kill_existing } = {}) {
         const info = JSON.parse(ready);
         return {
           success: true, platform: wsl ? 'wsl' : platform, binary: tvPath, pid: child?.pid ?? null,
-          cdp_port: cdpPort, cdp_url: `http://localhost:${cdpPort}`,
+          cdp_port: cdpPort, cdp_url: `http://${getCdpHost()}:${cdpPort}`,
           browser: info.Browser, user_agent: info['User-Agent'],
           ...(portMismatch ? { warning: `Launched on port ${cdpPort} but the MCP server's CDP client is bound to ${CDP_PORT}. Set TV_CDP_PORT=${cdpPort} and restart the server, or relaunch on ${CDP_PORT}.` } : {}),
         };
@@ -509,12 +511,13 @@ export async function ensureCDP({ _deps } = {}) {
   // per-call port would launch on it but leave subsequent calls talking to
   // the env-configured port instead. Use TV_CDP_PORT and restart the server
   // to point at a different instance.
-  const cdpPort = CDP_PORT;
+  const cdpPort = getCdpPort();
+  const probeUrl = _cdpUrl(cdpPort);
   const http = await import('http');
 
   // Step 1: Check if CDP is already responding
   const cdpAlive = await new Promise((resolve) => {
-    const req = http.get(`http://localhost:${cdpPort}/json/version`, { timeout: 1500 }, (res) => {
+    const req = http.get(probeUrl, { timeout: 1500 }, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
